@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/opskat/opskat/internal/ai/cmdline"
 	"github.com/opskat/opskat/internal/ai/permission"
 	"github.com/opskat/opskat/internal/model/entity/asset_entity"
 )
@@ -25,7 +26,7 @@ func parseExecArgs(args []string) (declaredType, scope, command string, err erro
 		arg := args[i]
 		switch {
 		case arg == "--":
-			command = strings.Join(args[i+1:], " ")
+			command = joinCommandWords(args[i+1:])
 		case arg == "--type":
 			if i+1 >= len(args) {
 				return "", "", "", fmt.Errorf("--type requires a value")
@@ -49,7 +50,7 @@ func parseExecArgs(args []string) (declaredType, scope, command string, err erro
 		case strings.HasPrefix(arg, "-"):
 			return "", "", "", fmt.Errorf("unknown flag %s (put the remote command after --)", arg)
 		default:
-			command = strings.Join(args[i:], " ")
+			command = joinCommandWords(args[i:])
 		}
 		break
 	}
@@ -70,6 +71,34 @@ func validateRedisScope(asset *asset_entity.Asset, scope string) error {
 		return nil
 	}
 	return fmt.Errorf("--scope is only meaningful for redis assets; asset %q is type=%s", asset.Name, asset.Type)
+}
+
+// joinCommandWords rebuilds the one command string from argv the local shell has
+// already split.
+//
+// A single word *is* that command string and is passed through untouched — it is the
+// documented form for every DSL opsctl forwards to (`-- "SELECT * FROM users"`), and
+// quoting it would hand the database a literal `'SELECT * FROM users'`.
+//
+// Two or more words are argv. Every consumer re-splits the result with a real shell
+// parser (the extension flag DSL and the k8s/etcd/kafka canonicalizers through
+// cmdline.Words, a remote shell for ssh), so a bare-space join would turn
+// `-- grep "foo bar" file` into four words. Only words containing whitespace carry a
+// boundary the join would destroy; the rest are emitted bare, so `-- ls *.log` still
+// reaches the remote shell as a glob, as ssh(1) does.
+func joinCommandWords(words []string) string {
+	if len(words) == 1 {
+		return words[0]
+	}
+	joined := make([]string, len(words))
+	for i, word := range words {
+		if strings.ContainsAny(word, " \t\n") {
+			joined[i] = cmdline.QuoteIfNeeded(word)
+			continue
+		}
+		joined[i] = word
+	}
+	return strings.Join(joined, " ")
 }
 
 // parseRemotePath parses numeric assetID:path strings without repository lookup.
