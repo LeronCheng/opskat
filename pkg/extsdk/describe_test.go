@@ -3,6 +3,7 @@ package opskat
 import (
 	"encoding/json"
 	"testing"
+	"time"
 
 	. "github.com/smartystreets/goconvey/convey"
 )
@@ -199,6 +200,161 @@ func TestRegistrationRejectsBrokenDeclarations(t *testing.T) {
 			So(func() {
 				Tool("bad", func(_ *ToolContext, _ string) (any, error) { return nil, nil })
 			}, ShouldPanic)
+		})
+	})
+}
+
+func TestDescribeReportsConnectionDeclaration(t *testing.T) {
+	Convey("an asset type's host-owned connection settings are reported only when declared", t, func() {
+		resetRegistries()
+		Extension(Meta{PolicyType: "demo"})
+		AssetType[demoConfig]("tunneled").Connection(Connection{SSHTunnel: true})
+		AssetType[demoConfig]("direct")
+
+		byType := map[string]map[string]any{}
+		for _, raw := range decodeDescribe(t)["assetTypes"].([]any) {
+			at := raw.(map[string]any)
+			byType[at["type"].(string)] = at
+		}
+		So(byType["tunneled"]["connection"], ShouldResemble, map[string]any{"sshTunnel": true})
+		So(byType["direct"], ShouldNotContainKey, "connection")
+	})
+}
+
+func TestDescribeReportsAuthDeclaration(t *testing.T) {
+	Convey("an asset type's credential injection is reported only when declared", t, func() {
+		resetRegistries()
+		Extension(Meta{PolicyType: "demo"})
+		AssetType[demoConfig]("injected").Auth(Auth{
+			Selector: "mode",
+			Groups: []AuthGroup{
+				{When: "basic", Bindings: []AuthBinding{{In: "basic", Value: "{{user}}:{{pass}}"}}},
+				{When: "key", Bindings: []AuthBinding{{In: "header", Name: "Authorization", Value: "ApiKey {{pass}}"}}},
+			},
+		})
+		AssetType[demoConfig]("plain")
+
+		byType := map[string]map[string]any{}
+		for _, raw := range decodeDescribe(t)["assetTypes"].([]any) {
+			at := raw.(map[string]any)
+			byType[at["type"].(string)] = at
+		}
+		So(byType["injected"]["auth"], ShouldResemble, map[string]any{
+			"selector": "mode",
+			"groups": []any{
+				map[string]any{"when": "basic", "bindings": []any{map[string]any{"in": "basic", "value": "{{user}}:{{pass}}"}}},
+				map[string]any{"when": "key", "bindings": []any{map[string]any{"in": "header", "name": "Authorization", "value": "ApiKey {{pass}}"}}},
+			},
+		})
+		So(byType["plain"], ShouldNotContainKey, "auth")
+	})
+}
+
+type searchArgs struct {
+	Index string `json:"index"`
+	Write bool   `json:"write,omitempty"`
+}
+
+func classifySearch(args searchArgs) (action, resource string) {
+	if args.Write {
+		return "index.write", args.Index
+	}
+	return "index.read", args.Index
+}
+
+func TestPolicyFuncClassifiesEachCall(t *testing.T) {
+	Convey("PolicyFunc answers check_policy from the call's own arguments", t, func() {
+		resetRegistries()
+		Extension(Meta{PolicyType: "demo"})
+		Tool("request", func(_ *ToolContext, _ searchArgs) (any, error) { return nil, nil }).
+			PolicyFunc([]string{"index.read", "index.write"}, classifySearch)
+
+		check := func(args string) (map[string]string, error) {
+			raw, err := dispatch("check_policy", []byte(`{"tool":"request","args":`+args+`}`))
+			if err != nil {
+				return nil, err
+			}
+			var decision map[string]string
+			So(json.Unmarshal(raw, &decision), ShouldBeNil)
+			return decision, nil
+		}
+
+		Convey("the action and resource come from the arguments", func() {
+			d, err := check(`{"index":"logs-2026"}`)
+			So(err, ShouldBeNil)
+			So(d, ShouldResemble, map[string]string{"action": "index.read", "resource": "logs-2026"})
+			d, err = check(`{"index":"logs-2026","write":true}`)
+			So(err, ShouldBeNil)
+			So(d, ShouldResemble, map[string]string{"action": "index.write", "resource": "logs-2026"})
+		})
+
+		Convey("arguments the tool cannot decode fail the check instead of classifying blind", func() {
+			_, err := check(`{"index":7}`)
+			So(err, ShouldNotBeNil)
+		})
+
+		Convey("describe declares the action set, not a fixed action", func() {
+			tool := decodeDescribe(t)["tools"].([]any)[0].(map[string]any)
+			So(tool["policyActions"], ShouldResemble, []any{"index.read", "index.write"})
+			So(tool, ShouldNotContainKey, "policyAction")
+		})
+
+		Convey("a fixed-action tool still describes and answers exactly as before", func() {
+			Tool("list", func(_ *ToolContext, _ listArgs) (any, error) { return nil, nil }).
+				Policy("list").Resource(func(a listArgs) string { return a.Bucket })
+			raw, err := dispatch("check_policy", []byte(`{"tool":"list","args":{"bucket":"b1"}}`))
+			So(err, ShouldBeNil)
+			So(string(raw), ShouldEqual, `{"action":"list","resource":"b1"}`)
+			for _, rawTool := range decodeDescribe(t)["tools"].([]any) {
+				tool := rawTool.(map[string]any)
+				if tool["name"] == "list" {
+					So(tool["policyAction"], ShouldEqual, "list")
+					So(tool, ShouldNotContainKey, "policyActions")
+				}
+			}
+		})
+	})
+
+	Convey("a PolicyFunc declaration that cannot be honored fails at init", t, func() {
+		resetRegistries()
+		noop := func(_ *ToolContext, _ searchArgs) (any, error) { return nil, nil }
+
+		Convey("no declared actions", func() {
+			So(func() { Tool("a", noop).PolicyFunc(nil, classifySearch) }, ShouldPanic)
+		})
+		Convey("combined with a fixed action", func() {
+			So(func() { Tool("b", noop).Policy("index.read").PolicyFunc([]string{"index.read"}, classifySearch) }, ShouldPanic)
+			So(func() { Tool("c", noop).PolicyFunc([]string{"index.read"}, classifySearch).Policy("index.read") }, ShouldPanic)
+		})
+		Convey("combined with Resource, which PolicyFunc already answers", func() {
+			So(func() {
+				Tool("d", noop).PolicyFunc([]string{"index.read"}, classifySearch).
+					Resource(func(a searchArgs) string { return a.Index })
+			}, ShouldPanic)
+		})
+	})
+}
+
+func TestDescribeReportsToolTimeout(t *testing.T) {
+	Convey("a tool's own timeout is declared through describe", t, func() {
+		resetRegistries()
+		AssetType[demoConfig]("demo")
+		Tool("slow", func(_ *ToolContext, _ struct{}) (any, error) { return nil, nil }).Policy("read").Timeout(2 * time.Minute)
+		Tool("plain", func(_ *ToolContext, _ struct{}) (any, error) { return nil, nil }).Policy("read")
+
+		byName := map[string]map[string]any{}
+		for _, raw := range decodeDescribe(t)["tools"].([]any) {
+			tool := raw.(map[string]any)
+			byName[tool["name"].(string)] = tool
+		}
+		So(byName["slow"]["timeoutMs"], ShouldEqual, float64(120000))
+		So(byName["plain"], ShouldNotContainKey, "timeoutMs")
+
+		Convey("a timeout outside (0, 10m] fails at registration", func() {
+			reg := Tool("bad", func(_ *ToolContext, _ struct{}) (any, error) { return nil, nil }).Policy("read")
+			So(func() { reg.Timeout(10*time.Minute + time.Millisecond) }, ShouldPanic)
+			So(func() { reg.Timeout(0) }, ShouldPanic)
+			So(func() { reg.Timeout(10 * time.Minute) }, ShouldNotPanic)
 		})
 	})
 }

@@ -35,6 +35,7 @@ import (
 	"github.com/opskat/opskat/internal/assetconn"
 	_ "github.com/opskat/opskat/internal/assettype"
 	"github.com/opskat/opskat/internal/bootstrap"
+	"github.com/opskat/opskat/internal/extreg"
 	"github.com/opskat/opskat/internal/pkg/portable"
 	"github.com/opskat/opskat/internal/repository/asset_repo"
 	"github.com/opskat/opskat/internal/repository/audit_repo"
@@ -395,15 +396,26 @@ func initExtensionSystem(
 
 	extDir := filepath.Join(dataDir, "extensions")
 	mgr := extpkg.NewManager(extDir, func(extName string) extpkg.HostProvider {
-		return extpkg.NewDefaultHostProvider(extpkg.DefaultHostConfig{
-			Logger:       logger.Default(),
-			AssetConfigs: extB.NewAssetConfigGetter(extName),
-			FileDialogs:  extB.NewFileDialogOpener(),
-			KV:           extB.NewKVStore(extName),
-			ActionEvents: extB.NewActionEventHandler(extName),
-			TunnelDialer: extB.NewTunnelDialer(),
+		provider := extpkg.NewDefaultHostProvider(extpkg.DefaultHostConfig{
+			Logger:        logger.Default(),
+			AssetConfigs:  extB.NewAssetConfigGetter(extName),
+			FileDialogs:   extB.NewFileDialogOpener(),
+			KV:            extB.NewKVStore(extName),
+			ActionEvents:  extB.NewActionEventHandler(extName),
+			AssetDialer:   extB.NewAssetDialer(extName),
+			ExtensionName: extName,
 		})
+		// The asset's cached HTTP client (kept for keep-alive reuse across calls)
+		// is built from its connection settings; once those change or the asset
+		// is gone, the cache must be dropped instead of reused on the next open.
+		extension.RegisterHTTPCacheInvalidator(extName, provider)
+		return provider
 	}, logger.Default())
+
+	// 测试连接：declare()d 处理器要跑 WASM，只在桌面进程接线（opsctl 走
+	// RegisterDescribeOnly，从不设置这个）。必须在任何扩展加载之前接好——extreg
+	// 加载期一遇到声明了处理器的类型就要拿它建 tester。
+	extreg.SetConnTestRegistrar(extB.NewConnTestRegistrar())
 
 	extSvc := extension_svc.New(
 		mgr,
@@ -419,6 +431,10 @@ func initExtensionSystem(
 	aiB.SetExtensionService(extSvc)
 	opsctlB.SetExtToolExecutor(desktopExecExecutor{})
 	opsctlB.SetExtDevInstaller(desktopExtDevInstaller{ext: extB})
+	// A page's own tool calls clear the exact same policy/approval/grant/audit
+	// gate opsctl's delegated exec runs through (opsctlB.RunPageToolCall reuses
+	// handleExtToolExec's gate, tagged with audit source "extension_page").
+	extB.SetPageToolGate(opsctlB)
 
 	// 接入 snippet 分类注册表
 	if svc := snippet_svc.Snippet(); svc != nil {

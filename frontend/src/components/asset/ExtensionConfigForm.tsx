@@ -1,10 +1,6 @@
-import { useState, useCallback, useMemo } from "react";
-import { toast } from "sonner";
-import { notifySuccess } from "@/lib/notify";
+import { useCallback, useMemo } from "react";
 import { useTranslation } from "react-i18next";
-import { Loader2, PlugZap } from "lucide-react";
 import {
-  Button,
   Input,
   Label,
   Select,
@@ -15,7 +11,6 @@ import {
   Switch,
   Textarea,
 } from "@opskat/ui";
-import { createExtensionAPI } from "@/extension/api";
 import { SecretInput } from "@/components/SecretInput";
 
 interface JSONSchemaProperty {
@@ -35,23 +30,15 @@ interface JSONSchema {
 }
 
 interface ExtensionConfigFormProps {
-  extensionName: string;
   configSchema: JSONSchema;
   value: Record<string, unknown>;
   onChange: (config: Record<string, unknown>) => void;
-  hasBackend?: boolean;
+  /** 有已存值、但宿主没把明文交给表单的密码字段（按字段名取）：呈现为"已设置，留空则不修改"。 */
+  withheldSecrets?: Record<string, string>;
 }
 
-export function ExtensionConfigForm({
-  extensionName,
-  configSchema,
-  value,
-  onChange,
-  hasBackend,
-}: ExtensionConfigFormProps) {
-  const { t: tCommon } = useTranslation();
-  const [testing, setTesting] = useState(false);
-
+export function ExtensionConfigForm({ configSchema, value, onChange, withheldSecrets }: ExtensionConfigFormProps) {
+  const { t } = useTranslation();
   const properties = configSchema.properties ?? {};
   const required = useMemo(() => new Set(configSchema.required ?? []), [configSchema.required]);
   const order = configSchema.propertyOrder;
@@ -65,18 +52,6 @@ export function ExtensionConfigForm({
     },
     [value, onChange]
   );
-
-  const handleTestConnection = useCallback(async () => {
-    setTesting(true);
-    try {
-      await createExtensionAPI().executeAction(extensionName, "test_connection", value);
-      notifySuccess(tCommon("asset.testConnectionSuccess"));
-    } catch (e) {
-      toast.error(`${tCommon("asset.testConnectionFailed")}: ${String(e)}`);
-    } finally {
-      setTesting(false);
-    }
-  }, [extensionName, value, tCommon]);
 
   const renderField = useCallback(
     (key: string, prop: JSONSchemaProperty) => {
@@ -182,7 +157,7 @@ export function ExtensionConfigForm({
               id={key}
               value={String(value[key] ?? "")}
               onChange={(e) => updateField(key, e.target.value)}
-              placeholder={placeholder || "••••••••"}
+              placeholder={withheldSecrets?.[key] ? t("asset.passwordUnchanged") : placeholder || "••••••••"}
             />
           ) : (
             <Input
@@ -196,27 +171,8 @@ export function ExtensionConfigForm({
         </div>
       );
     },
-    [value, required, updateField]
+    [value, required, updateField, withheldSecrets, t]
   );
 
-  return (
-    <>
-      {fields.map(([key, prop]) => renderField(key, prop))}
-
-      {/* Test Connection */}
-      {hasBackend && (
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          onClick={handleTestConnection}
-          disabled={testing}
-          className="gap-1 w-fit"
-        >
-          {testing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <PlugZap className="h-3.5 w-3.5" />}
-          {testing ? tCommon("asset.testing") : tCommon("asset.testConnection")}
-        </Button>
-      )}
-    </>
-  );
+  return <>{fields.map(([key, prop]) => renderField(key, prop))}</>;
 }

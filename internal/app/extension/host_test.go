@@ -108,6 +108,29 @@ func TestAssetConfigGetterScopesToCallingExtension(t *testing.T) {
 	})
 }
 
+func TestAssetConfigGetterStripsHostConnectionConfig(t *testing.T) {
+	Convey("ctx.AssetConfig() never sees the host's reserved connection key", t, func() {
+		e, assets := newHostTestBinder(t)
+		acme := e.NewAssetConfigGetter("acme")
+
+		cfg, err := json.Marshal(map[string]any{
+			"host": "h",
+			extension.HostConnectionConfigKey: map[string]any{
+				"tls": map[string]any{"enabled": true, "caFile": "/etc/ca.pem"},
+			},
+		})
+		So(err, ShouldBeNil)
+		assets.EXPECT().Find(gomock.Any(), int64(6)).Return(&asset_entity.Asset{ID: 6, Type: "acme-store", Config: string(cfg)}, nil)
+
+		raw, err := acme.GetAssetConfig(6)
+		So(err, ShouldBeNil)
+		var parsed map[string]any
+		So(json.Unmarshal(raw, &parsed), ShouldBeNil)
+		So(parsed, ShouldContainKey, "host")
+		So(parsed, ShouldNotContainKey, extension.HostConnectionConfigKey)
+	})
+}
+
 func TestFrontendCallsScopeAssetToExtension(t *testing.T) {
 	Convey("frontend-initiated calls may only name the extension's own assets", t, func() {
 		e, assets := newHostTestBinder(t)
@@ -142,6 +165,20 @@ func TestFrontendCallsScopeAssetToExtension(t *testing.T) {
 			cfg, err := e.GetDecryptedExtensionConfig(1, "acme")
 			So(err, ShouldBeNil)
 			So(cfg, ShouldContainSubstring, "s3cret")
+		})
+
+		// The configuration form shares its webview with extension pages, which can
+		// call this binding themselves: without credentials=read the stored secret is
+		// withheld outright — neither plaintext nor the guest's opaque handle, which
+		// the form would otherwise render (and save back) as a value.
+		Convey("GetDecryptedExtensionConfig withholds stored passwords from an extension without credentials=read", func() {
+			assets.EXPECT().Find(gomock.Any(), int64(4)).
+				Return(&asset_entity.Asset{ID: 4, Type: "other-store", Config: encryptedConfig(t, "theirs")}, nil)
+			raw, err := e.GetDecryptedExtensionConfig(4, "other")
+			So(err, ShouldBeNil)
+			var cfg map[string]any
+			So(json.Unmarshal([]byte(raw), &cfg), ShouldBeNil)
+			So(cfg, ShouldResemble, map[string]any{"host": "h"})
 		})
 	})
 }

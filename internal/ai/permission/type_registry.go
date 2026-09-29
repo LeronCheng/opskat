@@ -2,6 +2,7 @@ package permission
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"sync"
@@ -30,6 +31,11 @@ type permissionTypeHandler struct {
 	approvalType  string
 	grantPatterns GrantPatternsFunc
 	check         permissionCheckFunc
+	// classify is set only for types registered through RegisterPolicyCheck that
+	// opted in (extension types): it lets HandleConfirm show the check_policy
+	// classification on the approval item and persist grants by that classification
+	// instead of the raw command text (see ClassifyFunc).
+	classify ClassifyFunc
 }
 
 // registryMu 保护本文件的两张注册表（permissionTypes / execEntries）。内置类型在 init()
@@ -44,22 +50,25 @@ var permissionTypes = make(map[string]*permissionTypeHandler)
 var commandShape *shapeLanding
 
 func registerPermissionType(canonical, approvalType string, grantPatterns GrantPatternsFunc, check permissionCheckFunc, aliases ...string) {
-	if err := addPermissionType(canonical, approvalType, grantPatterns, check, aliases...); err != nil {
-		panic(err.Error())
-	}
-}
-
-func addPermissionType(canonical, approvalType string, grantPatterns GrantPatternsFunc, check permissionCheckFunc, aliases ...string) error {
-	if canonical == "" || approvalType == "" || check == nil {
-		return fmt.Errorf("permission: invalid type registration")
-	}
 	handler := &permissionTypeHandler{
 		canonical:     canonical,
 		approvalType:  approvalType,
 		grantPatterns: grantPatterns,
 		check:         check,
 	}
-	names := append([]string{canonical}, aliases...)
+	if err := addPermissionType(handler, aliases...); err != nil {
+		panic(err.Error())
+	}
+}
+
+// addPermissionType publishes a fully built handler under its canonical name and
+// aliases. The handler is never mutated afterwards: readers take it from the map
+// under registryMu and then use its fields without the lock.
+func addPermissionType(handler *permissionTypeHandler, aliases ...string) error {
+	if handler.canonical == "" || handler.approvalType == "" || handler.check == nil {
+		return fmt.Errorf("permission: invalid type registration")
+	}
+	names := append([]string{handler.canonical}, aliases...)
 	registryMu.Lock()
 	defer registryMu.Unlock()
 	for _, name := range names {
@@ -85,14 +94,42 @@ func addPermissionType(canonical, approvalType string, grantPatterns GrantPatter
 // 自己调 ConfirmFunc 会把 grant 整条丢掉。
 type PolicyCheckFunc func(ctx context.Context, assetID int64, command string) aictx.CheckResult
 
+// ExtensionClassification is what a registered extension type's classifier
+// (ClassifyFunc) reports about a command it just parsed: PolicyType/Action/Resource
+// are the check_policy classification used for policy matching, the approval item's
+// Action/Resource, and the "always allow" grant key (extGrantKey); Tool/Args are the
+// underlying guest call, rendered into the approval item's collapsible Detail (spec
+// 参数级策略 › 审批展示 — "工具名 + 参数，长 JSON 可折叠").
+type ExtensionClassification struct {
+	PolicyType string
+	Action     string
+	Resource   string
+	Tool       string
+	Args       json.RawMessage
+}
+
+// ClassifyFunc classifies a command for a registered extension type. ok is false when
+// classification is unavailable — parse/guest error, or check_policy naming an action
+// the type never declared — in which case HandleConfirm shows an approval item with no
+// Action/Resource, and "always allow" persists nothing rather than a grant for an
+// action the type doesn't recognize.
+type ClassifyFunc func(ctx context.Context, command string) (ExtensionClassification, bool)
+
 // RegisterPolicyCheck 注册一个运行期可再移除的资产类型的策略检查。审批面标签取类型名
 // 本身（与 ApprovalTypeFor 对未注册类型的回落一致），grant pattern 整串存一条。
+// classify 可为 nil（内置调用方目前都不需要它）；扩展类型传入自己的分类器，让
+// HandleConfirm 按 (action, resource) 而不是命令原文展示与落 grant（见 ClassifyFunc）。
 // 冲突返回错误而不是 panic：冲突来自用户装了两个声明同一类型的扩展。
-func RegisterPolicyCheck(canonical string, check PolicyCheckFunc) error {
+func RegisterPolicyCheck(canonical string, check PolicyCheckFunc, classify ClassifyFunc) error {
 	if check == nil {
 		return fmt.Errorf("permission: invalid policy check registration %q", canonical)
 	}
-	return addPermissionType(canonical, canonical, nil, permissionCheckFunc(check))
+	return addPermissionType(&permissionTypeHandler{
+		canonical:    canonical,
+		approvalType: canonical,
+		check:        permissionCheckFunc(check),
+		classify:     classify,
+	})
 }
 
 // UnregisterPolicyCheck 移除一个由 RegisterPolicyCheck 注册的类型。
@@ -107,6 +144,16 @@ func permissionTypeFor(name string) (*permissionTypeHandler, bool) {
 	defer registryMu.RUnlock()
 	handler, ok := permissionTypes[name]
 	return handler, ok
+}
+
+// classifyFor returns the ClassifyFunc registered for a canonical type, if any. Only
+// extension types opt in (see RegisterPolicyCheck); every built-in type reports false.
+func classifyFor(canonical string) (ClassifyFunc, bool) {
+	handler, ok := permissionTypeFor(canonical)
+	if !ok || handler.classify == nil {
+		return nil, false
+	}
+	return handler.classify, true
 }
 
 // ApprovalTypeFor 返回该资产类型在审批面板上的类型标签（前端 TypeBadge 按它取图标）。

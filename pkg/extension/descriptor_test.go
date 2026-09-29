@@ -3,6 +3,7 @@ package extension
 import (
 	"strings"
 	"testing"
+	"time"
 
 	. "github.com/smartystreets/goconvey/convey"
 )
@@ -171,6 +172,38 @@ func TestParseDescriptorTools(t *testing.T) {
 	})
 }
 
+func TestParseDescriptorToolTimeout(t *testing.T) {
+	tool := func(timeout string) []byte {
+		return desc(`"tools":[{"name":"t","policyAction":"read","parameters":{"type":"object","properties":{}}` + timeout + `}]`)
+	}
+	Convey("A tool may declare its own call timeout, within the host's ceiling", t, func() {
+		Convey("undeclared means the host default", func() {
+			d, err := ParseDescriptor(tool(""))
+			So(err, ShouldBeNil)
+			So(d.Tools[0].Timeout(), ShouldEqual, time.Duration(0))
+		})
+
+		Convey("a declaration up to ten minutes is kept", func() {
+			d, err := ParseDescriptor(tool(`,"timeoutMs":600000`))
+			So(err, ShouldBeNil)
+			So(d.Tools[0].Timeout(), ShouldEqual, 10*time.Minute)
+		})
+
+		Convey("a declaration over ten minutes is refused at load", func() {
+			_, err := ParseDescriptor(tool(`,"timeoutMs":600001`))
+			So(err, ShouldNotBeNil)
+			So(err.Error(), ShouldContainSubstring, `tools["t"].timeoutMs`)
+			So(err.Error(), ShouldContainSubstring, "10m0s")
+		})
+
+		Convey("a negative declaration is refused at load", func() {
+			_, err := ParseDescriptor(tool(`,"timeoutMs":-1`))
+			So(err, ShouldNotBeNil)
+			So(err.Error(), ShouldContainSubstring, `tools["t"].timeoutMs`)
+		})
+	})
+}
+
 func TestParseDescriptorSnippets(t *testing.T) {
 	Convey("Snippet declarations", t, func() {
 		Convey("a valid block", func() {
@@ -278,7 +311,7 @@ func TestApplyDescriptor(t *testing.T) {
 }
 
 // 权限组 ID 按声明者的策略面命名空间化（ext:<policies.type>:<name>），策略面名本身
-// 与资产类型同一套命名规则——组 ID 与规则落点 ext:<policyType>:<action> 都以它为段，
+// 与资产类型同一套命名规则——组 ID 与 grant（ext:<policyType>:<action>:<resource>）都以它为段，
 // 一个不受约束的策略面名会让两者的命名空间失去意义。
 func TestParseDescriptorPolicyNamespace(t *testing.T) {
 	group := func(id string) string {
@@ -320,6 +353,196 @@ func TestParseDescriptorPolicyNamespace(t *testing.T) {
 			err := parse("x", group("ext:x:read"), group("ext:x:read"))
 			So(err, ShouldNotBeNil)
 			So(err.Error(), ShouldContainSubstring, "duplicate")
+		})
+	})
+}
+
+// 连接配置区（隧道 / 代理链 / TLS）由宿主拥有，资产类型只声明支持哪几项；
+// 声明里出现宿主不认识的项要在加载时拒绝，而不是默默忽略成"不生效"。
+func TestParseDescriptorConnection(t *testing.T) {
+	Convey("An asset type declares which host-owned connection settings it supports", t, func() {
+		withConnection := func(conn string) []byte {
+			return []byte(`{"assetTypes":[{"type":"x","i18n":{"name":"n"},` +
+				`"configSchema":{"type":"object","properties":{"endpoint":{"type":"string","format":"endpoint"}}},` +
+				`"connection":` + conn + `}],"policies":{"type":"x"}}`)
+		}
+
+		Convey("a declared subset is kept", func() {
+			d, err := ParseDescriptor(withConnection(`{"sshTunnel":true}`))
+			So(err, ShouldBeNil)
+			So(d.AssetTypes[0].Connection, ShouldResemble, &ConnectionDef{SSHTunnel: true})
+		})
+
+		Convey("no declaration means no connection settings", func() {
+			d, err := ParseDescriptor(desc(""))
+			So(err, ShouldBeNil)
+			So(d.AssetTypes[0].Connection, ShouldBeNil)
+		})
+
+		Convey("an unknown connection item is refused", func() {
+			_, err := ParseDescriptor(withConnection(`{"sshTunnel":true,"vpn":true}`))
+			So(err, ShouldNotBeNil)
+			So(err.Error(), ShouldContainSubstring, `"vpn"`)
+		})
+
+		// Connection settings (and auth) apply only to the asset's endpoint: on a
+		// type with no endpoint field they would show in the form and never apply.
+		Convey("connection or auth on a type with no endpoint field is refused", func() {
+			for _, binding := range []string{
+				`"connection":{"sshTunnel":true}`,
+				`"auth":{"groups":[{"bindings":[{"in":"header","name":"X-Key","value":"{{endpoint}}"}]}]}`,
+			} {
+				_, err := ParseDescriptor([]byte(`{"assetTypes":[{"type":"x","i18n":{"name":"n"},` +
+					`"configSchema":{"type":"object","properties":{"endpoint":{"type":"string"}}},` +
+					binding + `}],"policies":{"type":"x"}}`))
+				So(err, ShouldNotBeNil)
+				So(err.Error(), ShouldContainSubstring, `format:"endpoint"`)
+			}
+		})
+	})
+}
+
+// 凭据注入的 auth 绑定由宿主在请求 endpoint 时渲染；模板只能引用该资产类型自己的
+// configSchema 字段——引用不存在的字段意味着宿主注入的东西永远是空的，必须在加载时拒绝。
+func TestParseDescriptorAuth(t *testing.T) {
+	Convey("An asset type declares auth bindings the host injects into requests to its endpoint", t, func() {
+		withAuth := func(auth string) []byte {
+			return []byte(`{"assetTypes":[{"type":"x","i18n":{"name":"n"},` +
+				`"configSchema":{"type":"object","properties":{` +
+				`"endpoint":{"type":"string","format":"endpoint"},"authType":{"type":"string"},` +
+				`"username":{"type":"string"},"password":{"type":"string","format":"password"}}},` +
+				`"auth":` + auth + `}],"policies":{"type":"x"}}`)
+		}
+		refused := func(auth, want string) {
+			_, err := ParseDescriptor(withAuth(auth))
+			So(err, ShouldNotBeNil)
+			So(err.Error(), ShouldContainSubstring, want)
+		}
+
+		Convey("groups selected by a config field, over header / query / basic, are kept", func() {
+			d, err := ParseDescriptor(withAuth(`{"selector":"authType","groups":[` +
+				`{"when":"basic","bindings":[{"in":"basic","value":"{{username}}:{{password}}"}]},` +
+				`{"when":"token","bindings":[{"in":"header","name":"Authorization","value":"ApiKey {{base64(username, \":\", password)}}"},` +
+				`{"in":"query","name":"sig","value":"{{ password }}"}]}]}`))
+			So(err, ShouldBeNil)
+			auth := d.AssetTypes[0].Auth
+			So(auth, ShouldNotBeNil)
+			So(auth.Selector, ShouldEqual, "authType")
+			So(auth.Groups, ShouldHaveLength, 2)
+			So(auth.Groups[1].Bindings[0], ShouldResemble, AuthBinding{In: "header", Name: "Authorization", Value: `ApiKey {{base64(username, ":", password)}}`})
+		})
+
+		Convey("a single group needs no selector", func() {
+			d, err := ParseDescriptor(withAuth(`{"groups":[{"bindings":[{"in":"header","name":"X-Token","value":"{{password}}"}]}]}`))
+			So(err, ShouldBeNil)
+			So(d.AssetTypes[0].Auth.Groups, ShouldHaveLength, 1)
+		})
+
+		Convey("no declaration means no injection", func() {
+			d, err := ParseDescriptor(desc(""))
+			So(err, ShouldBeNil)
+			So(d.AssetTypes[0].Auth, ShouldBeNil)
+		})
+
+		Convey("a template referencing a field the configSchema does not declare is refused", func() {
+			refused(`{"groups":[{"bindings":[{"in":"header","name":"Authorization","value":"Bearer {{token}}"}]}]}`, `"token"`)
+			refused(`{"groups":[{"bindings":[{"in":"basic","value":"{{base64(username, apiKey)}}"}]}]}`, `"apiKey"`)
+		})
+
+		Convey("a selector the configSchema does not declare is refused", func() {
+			refused(`{"selector":"mode","groups":[{"when":"a","bindings":[{"in":"basic","value":"{{username}}:{{password}}"}]}]}`, `"mode"`)
+		})
+
+		// The selector's value picks a group and is plain data the host logs and
+		// compares; a secret has no business choosing one, and reading it as a
+		// selector would put its plaintext into the host's logs.
+		Convey("a selector naming a password field is refused", func() {
+			refused(`{"selector":"password","groups":[{"when":"a","bindings":[{"in":"basic","value":"{{username}}:{{password}}"}]}]}`, `"password"`)
+		})
+
+		Convey("a malformed template is refused", func() {
+			refused(`{"groups":[{"bindings":[{"in":"header","name":"A","value":"{{password"}]}]}`, "unclosed")
+			refused(`{"groups":[{"bindings":[{"in":"header","name":"A","value":"{{md5(password)}}"}]}]}`, "md5(password)")
+			refused(`{"groups":[{"bindings":[{"in":"header","name":"A","value":"{{base64()}}"}]}]}`, "base64")
+		})
+
+		Convey("a location the host does not inject into is refused", func() {
+			refused(`{"groups":[{"bindings":[{"in":"cookie","name":"sid","value":"{{password}}"}]}]}`, `"cookie"`)
+		})
+
+		Convey("header and query bindings need a name, basic takes none", func() {
+			refused(`{"groups":[{"bindings":[{"in":"header","value":"{{password}}"}]}]}`, "name")
+			refused(`{"groups":[{"bindings":[{"in":"query","value":"{{password}}"}]}]}`, "name")
+			refused(`{"groups":[{"bindings":[{"in":"basic","name":"x","value":"{{username}}:{{password}}"}]}]}`, "name")
+			refused(`{"groups":[{"bindings":[{"in":"header","name":"Bad Header","value":"{{password}}"}]}]}`, "Bad Header")
+		})
+
+		Convey("groups must be selectable unambiguously", func() {
+			// several groups without a selector: which one applies is undecidable
+			refused(`{"groups":[{"bindings":[{"in":"basic","value":"{{username}}"}]},{"bindings":[{"in":"basic","value":"{{password}}"}]}]}`, "selector")
+			// with a selector every group names the value that selects it, once
+			refused(`{"selector":"authType","groups":[{"bindings":[{"in":"basic","value":"{{username}}"}]}]}`, "when")
+			refused(`{"selector":"authType","groups":[{"when":"a","bindings":[{"in":"basic","value":"{{username}}"}]},`+
+				`{"when":"a","bindings":[{"in":"basic","value":"{{password}}"}]}]}`, "duplicate")
+			refused(`{"groups":[]}`, "groups")
+			refused(`{"groups":[{"bindings":[]}]}`, "bindings")
+		})
+
+		Convey("an unknown key is refused rather than ignored", func() {
+			refused(`{"groups":[{"bindings":[{"in":"header","header":"Authorization","value":"{{password}}"}]}]}`, `"header"`)
+		})
+	})
+}
+
+// 一个工具要么声明固定动作（policyAction），要么声明按参数分类时可能给出的动作集合
+// （policyActions，SDK 的 PolicyFunc）。两种声明都并入 policies.actions——宿主拿它核对
+// guest 在 check_policy 里给出的动作。
+func TestParseDescriptorPolicyActionSets(t *testing.T) {
+	Convey("A tool declares the actions its policy classification can produce", t, func() {
+		tool := func(policy string) string {
+			return `"tools":[{"name":"t",` + policy + `,"parameters":{"type":"object","properties":{}}}]`
+		}
+
+		Convey("a classified tool's action set feeds policies.actions alongside fixed actions", func() {
+			m, err := ParseManifest([]byte(`{"name":"x","version":"1.0.0","hostABI":"2.0",` +
+				`"backend":{"runtime":"wasm","binary":"main.wasm"}}`))
+			So(err, ShouldBeNil)
+			d, err := ParseDescriptor(desc(`"tools":[` +
+				`{"name":"search","policyActions":["search","index.read"],"parameters":{"type":"object","properties":{}}},` +
+				`{"name":"list","policyAction":"list","parameters":{"type":"object","properties":{}}}]`))
+			So(err, ShouldBeNil)
+			m.apply(d)
+			So(m.Policies.Actions, ShouldResemble, []string{"index.read", "list", "search"})
+		})
+
+		Convey("a tool declaring both a fixed action and an action set", func() {
+			_, err := ParseDescriptor(desc(tool(`"policyAction":"read","policyActions":["read"]`)))
+			So(err, ShouldNotBeNil)
+			So(err.Error(), ShouldContainSubstring, "policyActions")
+		})
+
+		Convey("an empty entry in the action set", func() {
+			_, err := ParseDescriptor(desc(tool(`"policyActions":["read",""]`)))
+			So(err, ShouldNotBeNil)
+			So(err.Error(), ShouldContainSubstring, "policy action")
+		})
+
+		Convey("a duplicate entry in the action set", func() {
+			_, err := ParseDescriptor(desc(tool(`"policyActions":["read","read"]`)))
+			So(err, ShouldNotBeNil)
+			So(err.Error(), ShouldContainSubstring, "duplicate")
+		})
+
+		// 规则是 <action>[:<resource-glob>]，动作段在第一个 ':' 处结束；一个
+		// 自带 ':' 的动作名会让 "动作:资源" 与 "动作" 无从区分。
+		Convey("an action name that could be read as action:resource", func() {
+			_, err := ParseDescriptor(desc(tool(`"policyAction":"read:secret"`)))
+			So(err, ShouldNotBeNil)
+			So(err.Error(), ShouldContainSubstring, "read:secret")
+
+			_, err = ParseDescriptor(desc(tool(`"policyActions":["read","write:all"]`)))
+			So(err, ShouldNotBeNil)
+			So(err.Error(), ShouldContainSubstring, "write:all")
 		})
 	})
 }

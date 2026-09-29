@@ -92,10 +92,38 @@ func init() {
 		Name("policy.noDelete.name").Description("policy.noDelete.description").
 		Deny("delete").Default()
 
+	// Reading has a fixed action. The writing tools classify each call with
+	// PolicyFunc: the action plus the note key it touches, so the user can narrow a
+	// rule to keys — `ext:notebook:write:runbook/*` allows writing runbooks only,
+	// while the default group's bare `delete` deny still covers every key. The
+	// action set passed alongside is what describe() declares; the host refuses
+	// any other action the function might return.
 	opskat.Tool("note_list", listNotes).Policy("read").Doc("tools.note_list.description")
 	opskat.Tool("note_get", getNote).Policy("read").Doc("tools.note_get.description")
-	opskat.Tool("note_put", putNote).Policy("write").Doc("tools.note_put.description")
-	opskat.Tool("note_delete", deleteNote).Policy("delete").Doc("tools.note_delete.description")
+	opskat.Tool("note_put", putNote).
+		PolicyFunc([]string{"write"}, func(args putArgs) (string, string) {
+			// The key the handler will write, trimmed the same way checkNoteKey does.
+			return "write", strings.TrimSpace(args.Key)
+		}).
+		Doc("tools.note_put.description")
+	opskat.Tool("note_delete", deleteNote).
+		PolicyFunc([]string{"delete"}, func(args deleteArgs) (string, string) {
+			return "delete", args.Key
+		}).
+		Doc("tools.note_delete.description")
+
+	// The reference extension's own page: it exercises the seam task 8 adds
+	// (frontend/page.js calls note_list/note_put/note_delete through
+	// window.__OPSKAT_EXT__.api.callTool, which now clears the same policy /
+	// approval / grant / audit gate opsctl's delegated exec does) rather than
+	// dialing the plugin directly. Slot "asset.connect" is what makes
+	// double-clicking a notebook asset open it.
+	opskat.Frontend(opskat.FrontendSpec{
+		Entry: "page.js",
+		Pages: []opskat.Page{
+			{ID: "notebook", Slot: "asset.connect", Name: "page.notebook.title", Component: "NotebookPage"},
+		},
+	})
 }
 
 // noteSummary is what listing reports: enough to choose a note without shipping

@@ -1,6 +1,7 @@
 package extension
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // HostABIVersion is the current host ABI contract version.
@@ -18,10 +20,19 @@ import (
 // 2.0 is the reactor contract: the module is a WASI reactor exporting
 // opskat_call / malloc / free, it imports exactly host_call + host_io, and it
 // answers describe().
-const HostABIVersion = "2.0"
+//
+// 2.1 additionally exposes @opskat/host-ui to extension pages (a code editor,
+// JSON tree view, and result table injected on window.__OPSKAT_EXT__.hostUI) —
+// a frontend-only addition that changes nothing about the WASM host_call/host_io
+// contract. A 2.0 extension keeps loading and working exactly as before; it just
+// doesn't get hostUI.
+const HostABIVersion = "2.1"
 
-// SupportedHostABIs lists all host ABI versions the runtime accepts.
-var SupportedHostABIs = []string{"2.0"}
+// SupportedHostABIs lists all host ABI versions the runtime accepts. 2.0 stays
+// listed so extensions built before host-ui keep loading unchanged; only a
+// hostABI newer than everything here (e.g. an extension declaring 2.2 or 3.0)
+// is refused.
+var SupportedHostABIs = []string{"2.0", "2.1"}
 
 var (
 	semverRe         = regexp.MustCompile(`^\d+\.\d+\.\d+$`)
@@ -137,7 +148,22 @@ type Capabilities struct {
 	FS          FSCapability   `json:"fs"`
 	HTTP        HTTPCapability `json:"http"`
 	Credentials string         `json:"credentials"` // "" (none) | "read"
-	Tunnel      bool           `json:"tunnel"`      // allow routing HTTP through the asset's SSH tunnel
+	// Tunnel lets an allowlisted (non-endpoint) HTTP target resolve to a private
+	// address. Routing through an asset's SSH tunnel is an asset type's
+	// connection.sshTunnel declaration, not this capability.
+	Tunnel  bool              `json:"tunnel"`
+	Network NetworkCapability `json:"network"`
+}
+
+// NetworkCapability grants network reach that is decided per call rather than by
+// a static list.
+//
+// AssetEndpoint lets a call scoped to an asset reach the addresses the user typed
+// into that asset's format:"endpoint" config fields — private-network addresses
+// included, since the user configured them — over HTTP and TCP. Undeclared, HTTP
+// reach is exactly the static http allowlist and TCP stays ungated.
+type NetworkCapability struct {
+	AssetEndpoint bool `json:"assetEndpoint"`
 }
 
 // FSCapability lists filesystem path patterns an extension may access.
@@ -170,7 +196,75 @@ type AssetTypeDef struct {
 	Type         string         `json:"type"`
 	I18n         I18nName       `json:"i18n"`
 	ConfigSchema map[string]any `json:"configSchema"`
-	ProxyChain   bool           `json:"proxyChain,omitempty"` // opt in; false keeps the asset direct
+	Connection   *ConnectionDef `json:"connection,omitempty"`
+	Auth         *AuthDef       `json:"auth,omitempty"`
+	// TestConnection reports whether the type registered a test-connection
+	// handler (opskat.AssetTypeReg.TestConnection in the guest SDK). The
+	// asset form shows its "Test connection" button only when this is true;
+	// the host dispatches the call itself (Plugin.TestConnection), never
+	// through policy — testing a connection is not an operation on the asset.
+	TestConnection bool `json:"testConnection,omitempty"`
+}
+
+// ConnectionDef is the subset of the host-owned connection settings an asset
+// type supports. The host renders a declared item in the asset form and detail
+// card and applies it when dialing the asset's endpoint; an undeclared item is
+// neither shown nor applied. The extension never reads these settings — the SSH
+// tunnel is the asset's own SSHTunnelID column, outside its config.
+type ConnectionDef struct {
+	SSHTunnel  bool `json:"sshTunnel,omitempty"`
+	ProxyChain bool `json:"proxyChain,omitempty"`
+	TLS        bool `json:"tls,omitempty"`
+}
+
+// UnmarshalJSON refuses an item the host does not own: silently dropping it would
+// load an extension whose author believes a setting is applied when it is not.
+func (c *ConnectionDef) UnmarshalJSON(data []byte) error {
+	type plain ConnectionDef
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	var v plain
+	if err := dec.Decode(&v); err != nil {
+		return fmt.Errorf("connection (supported items: sshTunnel, proxyChain, tls): %w", err)
+	}
+	*c = ConnectionDef(v)
+	return nil
+}
+
+// bindsEndpoint reports whether the type declares anything the host applies only
+// on a connection to the asset's endpoint: credential injection or a connection
+// setting.
+func (at AssetTypeDef) bindsEndpoint() bool {
+	c := at.Connection
+	return at.Auth != nil || (c != nil && (c.SSHTunnel || c.ProxyChain || c.TLS))
+}
+
+// validateEndpointBindings refuses an asset type whose auth or connection
+// declaration could never take effect: both apply only to a request to one of the
+// asset's endpoints, and an extension without network.assetEndpoint has none. It
+// runs once describe() is merged in, since the declaration comes from the guest
+// and the capability from manifest.json.
+func (m *Manifest) validateEndpointBindings() error {
+	if m.Capabilities.Network.AssetEndpoint {
+		return nil
+	}
+	for _, at := range m.AssetTypes {
+		if at.bindsEndpoint() {
+			return fmt.Errorf("asset type %q declares auth or connection, which apply only to the asset's endpoint, but the manifest does not declare capabilities.network.assetEndpoint", at.Type)
+		}
+	}
+	return nil
+}
+
+// AssetTypeDef returns the declaration of assetType, nil when the extension does
+// not register it.
+func (m *Manifest) AssetTypeDef(assetType string) *AssetTypeDef {
+	for i := range m.AssetTypes {
+		if m.AssetTypes[i].Type == assetType {
+			return &m.AssetTypes[i]
+		}
+	}
+	return nil
 }
 
 type I18nName struct {
@@ -186,11 +280,38 @@ type ToolDef struct {
 	Name       string         `json:"name"`
 	I18n       I18nDesc       `json:"i18n"`
 	Parameters map[string]any `json:"parameters"`
-	// PolicyAction is the action this tool requests; the asset's permission groups
-	// are matched against it. It is declared at the tool's registration in the
-	// guest, which is also what makes the guest's policy answer unable to drift
+	// PolicyAction is the fixed action this tool requests; the asset's permission
+	// groups are matched against it. It is declared at the tool's registration in
+	// the guest, which is also what makes the guest's policy answer unable to drift
 	// from its tool table.
 	PolicyAction string `json:"policyAction,omitempty"`
+	// PolicyActions is, instead of PolicyAction, the set of actions a tool that
+	// classifies each call from its arguments (the SDK's PolicyFunc) may answer
+	// check_policy with. A tool declares exactly one of the two.
+	PolicyActions []string `json:"policyActions,omitempty"`
+	// TimeoutMs is how long one call of this tool may run, in milliseconds; 0
+	// means the host default. It is the tool's to declare because only the tool
+	// knows whether it answers in a second or scans an index for minutes, and it
+	// holds for every caller alike — AI exec, opsctl and the extension's page.
+	TimeoutMs int64 `json:"timeoutMs,omitempty"`
+}
+
+// MaxToolTimeout is the longest timeout a tool may declare. A tool call holds
+// one of the extension's few instance slots for as long as it runs; work that
+// needs longer is an action, which streams progress and can be canceled.
+const MaxToolTimeout = 10 * time.Minute
+
+// Timeout is the tool's declared call timeout, 0 when it leaves the host default.
+func (t ToolDef) Timeout() time.Duration {
+	return time.Duration(t.TimeoutMs) * time.Millisecond
+}
+
+// Actions is every policy action the tool can request.
+func (t ToolDef) Actions() []string {
+	if t.PolicyAction != "" {
+		return []string{t.PolicyAction}
+	}
+	return t.PolicyActions
 }
 
 type I18nDesc struct {

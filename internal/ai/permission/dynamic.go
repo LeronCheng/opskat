@@ -10,14 +10,16 @@ import (
 	"github.com/opskat/opskat/internal/ai/policy"
 )
 
-// MatchGrant 报告该资产上是否已有一条批准过的常驻授权覆盖这条命令。
-//
-// 导出的理由与 RegisterPolicyCheck 一样：运行期注册进来的类型（扩展提供的资产类型）
-// 的判定函数住在本包之外，而 grant 匹配是**每个** PolicyCheckFunc 在返回 NeedConfirm
-// 之前必须走的最后一步。内置类型的检查函数在本包内直接调 matchGrantForAsset；包外的
-// 检查函数漏掉这一步，用户点过"始终允许"后下一条同样的命令还是会弹框。
-func MatchGrant(ctx context.Context, assetID int64, command, approvalType string) (aictx.CheckResult, bool) {
-	result := matchGrantForAsset(ctx, assetID, command, approvalType)
+// MatchExtensionGrant is the grant lookup of a classify-registered extension type's
+// policy check (a PolicyCheckFunc lives outside this package, so the lookup is
+// exported): it builds the current call's grant key from its live (policyType, action,
+// resource) classification — never from the raw command text — so a later call that
+// spells the same request differently (different flag order, an equivalent literal)
+// still hits the grant, and a grant for one resource never covers another. See
+// extGrantMatch for how a stored pattern is compared against it.
+func MatchExtensionGrant(ctx context.Context, assetID int64, approvalType, policyType, action, resource string) (aictx.CheckResult, bool) {
+	key := extGrantKey(policyType, action, resource)
+	result := matchGrantForAssetWith(ctx, assetID, key, approvalType, extGrantMatch)
 	if result == nil {
 		return aictx.CheckResult{}, false
 	}
@@ -25,8 +27,8 @@ func MatchGrant(ctx context.Context, assetID int64, command, approvalType string
 }
 
 // ExtensionPolicyForAsset 收集一个扩展策略面在资产 holder 链（资产 → 组 → 父组）
-// 上的两样东西：引用的权限组 ID，以及 holder 自己在这个策略面上的永久规则。两者一趟
-// 走完——每条命令都要问一次，而组链要读库。
+// 上的两样东西：引用的权限组 ID，以及 holder 自己在这个策略面上的永久规则
+// （`<action>[:<resource-glob>]`）。两者一趟走完——每条命令都要问一次，而组链要读库。
 //
 // 之所以由本包给出：holder 链的走法（policyHoldersForAsset）与策略面的读法
 // （rule_ext.go 注册的落点）都是本包的知识，而扩展的判定函数住在包外。

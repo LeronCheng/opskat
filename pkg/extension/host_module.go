@@ -49,6 +49,7 @@ type hostRequest struct {
 // hostCallEnv is what an op handler is allowed to reach: the extension's
 // capabilities, and the invocation the call belongs to.
 type hostCallEnv struct {
+	ctx  context.Context
 	host HostProvider
 	inv  *invocation
 }
@@ -105,7 +106,7 @@ func hostCall(ctx context.Context, host HostProvider, req []byte) ([]byte, error
 	if !ok {
 		return nil, fmt.Errorf("unknown host op %q", envelope.Op)
 	}
-	return fn(hostCallEnv{host: host, inv: inv}, envelope.Params)
+	return fn(hostCallEnv{ctx: ctx, host: host, inv: inv}, envelope.Params)
 }
 
 func hostIO(ctx context.Context, mod api.Module, handle, op, ptr, size uint32) ([]byte, error) {
@@ -223,11 +224,12 @@ func opIOOpen(env hostCallEnv, params json.RawMessage) ([]byte, error) {
 	if err := json.Unmarshal(params, &p); err != nil {
 		return nil, err
 	}
-	res, err := env.host.OpenIO(p)
+	epoch := env.inv.io.Epoch()
+	res, err := env.host.OpenIO(env.ctx, env.inv.asset, p)
 	if err != nil {
 		return nil, err
 	}
-	handle, err := env.inv.io.Register(res)
+	handle, err := env.inv.io.RegisterSince(epoch, res)
 	if err != nil {
 		return nil, err
 	}

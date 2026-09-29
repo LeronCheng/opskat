@@ -11,8 +11,10 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	opskat "github.com/opskat/opskat/pkg/extsdk"
@@ -52,8 +54,29 @@ type spinArgs struct {
 	MS int `json:"ms" desc:"How long to busy-loop, in milliseconds"`
 }
 
+type blobArgs struct {
+	Bytes int `json:"bytes" desc:"Size of the returned data string"`
+}
+
+type urlArgs struct {
+	URL string `json:"url" desc:"URL to GET"`
+}
+
+type addrArgs struct {
+	Addr string `json:"addr" desc:"host:port to dial"`
+}
+
+// fixtureConfig's endpoint (a URL or host:port) is what the host's
+// network.assetEndpoint gate lets a call scoped to the asset reach. authType
+// picks which of the declared auth groups the host injects into requests to
+// that endpoint, rendered from username / password. password is a Credential,
+// so it decodes both the plaintext served with credentials:read and the opaque
+// handle served without it (this manifest does not declare it).
 type fixtureConfig struct {
-	Endpoint string `json:"endpoint" title:"Endpoint"`
+	Endpoint string            `json:"endpoint" title:"Endpoint" format:"endpoint"`
+	AuthType string            `json:"authType,omitempty" title:"Auth type" enum:"none,basic,bearer,signed"`
+	Username string            `json:"username,omitempty" title:"Username"`
+	Password opskat.Credential `json:"password,omitempty" title:"Password"`
 }
 
 func init() {
@@ -62,7 +85,35 @@ func init() {
 		Description: "Minimal extension used by pkg/extension end-to-end tests",
 		PolicyType:  "fixture",
 	})
-	opskat.AssetType[fixtureConfig]("fixture").Name("Fixture")
+	opskat.AssetType[fixtureConfig]("fixture").Name("Fixture").Connection(opskat.Connection{SSHTunnel: true}).
+		Auth(opskat.Auth{
+			Selector: "authType",
+			Groups: []opskat.AuthGroup{
+				{When: "basic", Bindings: []opskat.AuthBinding{{In: "basic", Value: "{{username}}:{{password}}"}}},
+				{When: "bearer", Bindings: []opskat.AuthBinding{{In: "header", Name: "Authorization", Value: "Bearer {{password}}"}}},
+				{When: "signed", Bindings: []opskat.AuthBinding{{In: "query", Name: "token", Value: `{{base64(username, ":", password)}}`}}},
+			},
+		}).
+		// TestConnection reaches the endpoint through the same host IO and
+		// network gate a tool call would, and reports HTTP's own client error —
+		// so the host-side test exercises the real ad-hoc dial/endpoint/auth path
+		// a "test connection" call runs (not a real tool call), rather than a
+		// second handler that just returns nil.
+		TestConnection(func(cfg fixtureConfig) error {
+			h, err := opskat.IOOpen("http", map[string]any{"method": "GET", "url": cfg.Endpoint})
+			if err != nil {
+				return err
+			}
+			defer h.Close()
+			meta, err := h.Flush()
+			if err != nil {
+				return err
+			}
+			if meta.Status >= 400 {
+				return fmt.Errorf("test connection: unexpected status %d", meta.Status)
+			}
+			return nil
+		})
 	opskat.PolicyGroup("ext:fixture:read").Name("Read").Description("Read-only").
 		Allow("read").Default()
 
@@ -152,6 +203,49 @@ func init() {
 		return map[string]any{"config": json.RawMessage(cfg), "asset": ctx.Asset}, nil
 	}).Policy("read")
 
+	// typed_config decodes the asset config into the same struct AssetType
+	// reflected the form from, the way an extension actually consumes it, and
+	// reports what the password field carried.
+	opskat.Tool("typed_config", func(ctx *opskat.ToolContext, _ noArgs) (any, error) {
+		raw, err := ctx.AssetConfig()
+		if err != nil {
+			return nil, err
+		}
+		var cfg fixtureConfig
+		if err := json.Unmarshal(raw, &cfg); err != nil {
+			return nil, err
+		}
+		password, err := cfg.Password.Plaintext()
+		withheld := errors.Is(err, opskat.ErrCredentialWithheld)
+		if err != nil && !withheld {
+			return nil, err
+		}
+		return map[string]any{"passwordSet": cfg.Password.IsSet(), "password": password, "withheld": withheld}, nil
+	}).Policy("read")
+
+	// http_get and tcp_echo reach the network through host IO, so a test sees
+	// exactly what the host's network gate lets a guest reach.
+	opskat.Tool("http_get", func(_ *opskat.ToolContext, args urlArgs) (any, error) {
+		h, err := opskat.IOOpen("http", map[string]any{"method": "GET", "url": args.URL})
+		if err != nil {
+			return nil, err
+		}
+		defer h.Close()
+		meta, err := h.Flush()
+		if err != nil {
+			return nil, err
+		}
+		body, err := io.ReadAll(h)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"status": meta.Status, "headers": meta.Headers, "body": string(body)}, nil
+	}).Policy("read")
+
+	opskat.Tool("tcp_echo", func(_ *opskat.ToolContext, args addrArgs) (any, error) {
+		return tcpEcho(args.Addr)
+	}).Policy("read")
+
 	opskat.Tool("log", func(_ *opskat.ToolContext, args logArgs) (any, error) {
 		opskat.Log(args.Level, args.Msg)
 		return map[string]any{"ok": true}, nil
@@ -162,6 +256,21 @@ func init() {
 	opskat.Tool("spin", func(_ *opskat.ToolContext, args spinArgs) (any, error) {
 		return spin(args.MS), nil
 	}).Policy("read")
+	// spin_short and spin_long are spin with their own declared timeouts, which
+	// replace the host's default for their calls — shorter and longer.
+	opskat.Tool("spin_short", func(_ *opskat.ToolContext, args spinArgs) (any, error) {
+		return spin(args.MS), nil
+	}).Policy("read").Timeout(300 * time.Millisecond)
+	opskat.Tool("spin_long", func(_ *opskat.ToolContext, args spinArgs) (any, error) {
+		return spin(args.MS), nil
+	}).Policy("read").Timeout(time.Minute)
+
+	// blob returns a result of the requested size, so a test can cross the
+	// host's result size limit.
+	opskat.Tool("blob", func(_ *opskat.ToolContext, args blobArgs) (any, error) {
+		return map[string]any{"data": strings.Repeat("x", args.Bytes)}, nil
+	}).Policy("read")
+
 	opskat.RegisterAction("spin", func(ctx *opskat.ActionContext) (any, error) {
 		var args spinArgs
 		if err := json.Unmarshal(ctx.Args, &args); err != nil {
@@ -196,6 +305,17 @@ func init() {
 		return map[string]any{"sent": sent, "stopped": false}, nil
 	})
 
+	// tcp_echo as an action: it blocks in a host read until the server answers,
+	// so a test can see that canceling the action interrupts host IO instead of
+	// waiting for the guest to next poll ShouldStop.
+	opskat.RegisterAction("tcp_echo", func(ctx *opskat.ActionContext) (any, error) {
+		var args addrArgs
+		if err := json.Unmarshal(ctx.Args, &args); err != nil {
+			return nil, err
+		}
+		return tcpEcho(args.Addr)
+	})
+
 	// should_stop reports the cancellation flag once, without looping. A fresh
 	// invocation must never inherit a previous invocation's cancellation.
 	opskat.RegisterAction("should_stop", func(ctx *opskat.ActionContext) (any, error) {
@@ -210,6 +330,15 @@ func init() {
 		if cfg.Endpoint == "" {
 			return []opskat.ValidationError{{Field: "endpoint", Message: "endpoint is required"}}
 		}
+		// The host reserves this key for connection settings (proxy chain, TLS)
+		// it owns; it must strip it before this call ever sees the config. If it
+		// shows up here, the host's boundary leaked it to the guest.
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(config, &raw); err == nil {
+			if _, leaked := raw["__opskat_connection"]; leaked {
+				return []opskat.ValidationError{{Field: "", Message: "host connection config leaked to guest"}}
+			}
+		}
 		return nil
 	})
 }
@@ -221,4 +350,21 @@ func spin(ms int) map[string]any {
 		iterations++
 	}
 	return map[string]any{"iterations": iterations}
+}
+
+func tcpEcho(addr string) (any, error) {
+	conn, err := opskat.Dial("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("ping")); err != nil {
+		return nil, err
+	}
+	buf := make([]byte, 16)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"echo": string(buf[:n])}, nil
 }

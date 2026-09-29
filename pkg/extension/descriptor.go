@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode"
 )
 
 // Descriptor is what the guest answers to describe(): everything an extension can
@@ -77,16 +78,33 @@ func (d *Descriptor) validateAssetScope() error {
 			return fmt.Errorf("describe(): duplicate asset type %q", at.Type)
 		}
 		seen[at.Type] = struct{}{}
-		if len(ConfigSchemaProperties(at.ConfigSchema)) == 0 {
+		props := ConfigSchemaProperties(at.ConfigSchema)
+		if len(props) == 0 {
 			return fmt.Errorf("describe(): assetTypes[%q].configSchema must declare properties", at.Type)
+		}
+		if at.bindsEndpoint() && len(EndpointFieldsFromSchema(at.ConfigSchema)) == 0 {
+			return fmt.Errorf(`describe(): assetTypes[%q] declares auth or connection, which apply only to the asset's endpoint, but its configSchema marks no field format:"endpoint"`, at.Type)
+		}
+		if at.Auth != nil {
+			declared := make(map[string]bool, len(props))
+			for _, p := range props {
+				declared[p] = true
+			}
+			secrets := make(map[string]bool)
+			for _, p := range PasswordFieldsFromSchema(at.ConfigSchema) {
+				secrets[p] = true
+			}
+			if err := at.Auth.validate(declared, secrets); err != nil {
+				return fmt.Errorf("describe(): assetTypes[%q].%w", at.Type, err)
+			}
 		}
 	}
 	if d.Policies.Type == "" {
 		return fmt.Errorf("describe(): policies.type is required — it names the policy face the extension's asset types are checked under")
 	}
-	// The policy type is a namespace segment of both the extension's policy group
-	// IDs (ext:<type>:<name>) and its permanent rules (ext:<type>:<action>); a name
-	// that could itself contain ":" would let one face's namespace spell another's.
+	// The policy type is a namespace segment of the extension's policy group IDs
+	// (ext:<type>:<name>) and grants (ext:<type>:<action>:<resource>); a name that
+	// could itself contain ":" would let one face's namespace spell another's.
 	if !nameRe.MatchString(d.Policies.Type) {
 		return fmt.Errorf("describe(): policies.type must match %s (got %q)", nameRe.String(), d.Policies.Type)
 	}
@@ -126,8 +144,11 @@ func (d *Descriptor) validateTools() error {
 			return fmt.Errorf("describe(): duplicate tool name %q", t.Name)
 		}
 		seen[t.Name] = true
-		if t.PolicyAction == "" {
-			return fmt.Errorf("describe(): tools[%q] declares no policy action — every tool is checked against the asset's permission groups", t.Name)
+		if err := t.validateActions(); err != nil {
+			return err
+		}
+		if t.TimeoutMs < 0 || t.TimeoutMs > MaxToolTimeout.Milliseconds() {
+			return fmt.Errorf("describe(): tools[%q].timeoutMs must be between 0 (host default) and %d (%s), got %d", t.Name, MaxToolTimeout.Milliseconds(), MaxToolTimeout, t.TimeoutMs)
 		}
 		if t.Parameters == nil {
 			return fmt.Errorf("describe(): tools[%q].parameters is required (an object schema, empty properties for a no-arg tool)", t.Name)
@@ -266,6 +287,37 @@ func (d *Descriptor) validateSnippets() error {
 	return nil
 }
 
+// validateActions checks what the tool declares it can request: a fixed action or
+// the set a per-call classification picks from, never both and never neither.
+//
+// An action name is the segment of a rule <action>[:<resource-glob>]
+// that ends at the first ':' — a name that itself contains ':' (or whitespace,
+// which a rule is trimmed of) could not be told apart from an action plus a
+// resource, so it is refused here rather than silently never matching.
+func (t ToolDef) validateActions() error {
+	if t.PolicyAction != "" && len(t.PolicyActions) > 0 {
+		return fmt.Errorf("describe(): tools[%q] declares both policyAction and policyActions — a tool's action is either fixed or classified per call", t.Name)
+	}
+	actions := t.Actions()
+	if len(actions) == 0 {
+		return fmt.Errorf("describe(): tools[%q] declares no policy action — every tool is checked against the asset's permission groups", t.Name)
+	}
+	seen := make(map[string]struct{}, len(actions))
+	for _, a := range actions {
+		if a == "" {
+			return fmt.Errorf("describe(): tools[%q] declares an empty policy action", t.Name)
+		}
+		if strings.ContainsFunc(a, func(r rune) bool { return r == ':' || unicode.IsSpace(r) }) {
+			return fmt.Errorf("describe(): tools[%q] policy action %q must not contain ':' or whitespace — rules are <action>[:<resource-glob>]", t.Name, a)
+		}
+		if _, dup := seen[a]; dup {
+			return fmt.Errorf("describe(): tools[%q] declares policy action %q twice (duplicate)", t.Name, a)
+		}
+		seen[a] = struct{}{}
+	}
+	return nil
+}
+
 // apply merges the guest's functional face onto the manifest's security face.
 //
 // policies.actions is not on the wire: it is exactly the set of actions the tools
@@ -286,11 +338,13 @@ func policyActions(tools []ToolDef) []string {
 	seen := make(map[string]struct{}, len(tools))
 	actions := make([]string, 0, len(tools))
 	for _, t := range tools {
-		if _, dup := seen[t.PolicyAction]; dup {
-			continue
+		for _, a := range t.Actions() {
+			if _, dup := seen[a]; dup {
+				continue
+			}
+			seen[a] = struct{}{}
+			actions = append(actions, a)
 		}
-		seen[t.PolicyAction] = struct{}{}
-		actions = append(actions, t.PolicyAction)
 	}
 	sort.Strings(actions)
 	return actions

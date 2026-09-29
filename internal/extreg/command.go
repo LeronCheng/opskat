@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -13,16 +14,20 @@ import (
 	"github.com/opskat/opskat/pkg/extension"
 )
 
-// parseCommand 把 `<tool> --flag=value` 解析成工具名与按 manifest 声明类型转换过的
-// JSON 参数。扩展名不在命令里：资产类型 → 扩展是一对一的（注册时强制），命令面上再写
-// 一次扩展名只是让模型多一个能写错的位置。
+// parseCommand 把 `<tool> --flag=value`（或 `<tool> --flag value`，见下）解析成工具名
+// 与按 manifest 声明类型转换过的 JSON 参数。扩展名不在命令里：资产类型 → 扩展是一对一的
+// （注册时强制），命令面上再写一次扩展名只是让模型多一个能写错的位置。
 //
-// 切词复用 internal/ai/cmdline —— 与内置类型的 exec DSL 同一份引号感知实现。
+// 切词复用 internal/ai/cmdline —— 与内置类型的 exec DSL 同一份引号感知实现。裸
+// `--flag value`（空格分隔、不带 "="）按 manifest 声明的参数类型决定：非 boolean
+// 消费下一个词作为值（cmdline.WithValueFlags），boolean 保持裸 flag = "true" 的语义，
+// 不会把下一个词错吞成自己的值。opsctl 一侧的 opsctl exec <asset> -- <tool> --flag ...
+// 多词形式因此不必强制模型总是写 --k=v。
 //
 // --json 是逃生口：flag DSL 表达不了嵌套结构，而 manifest 允许声明它们；没有逃生口
 // 就会出现"注册了却调不动"的工具。它与其它 flag 互斥——两者混用时哪个赢都是猜。
 func parseCommand(m *extension.Manifest, command string) (string, []byte, error) {
-	c, err := cmdline.Parse(command)
+	c, err := cmdline.Parse(command, flagGrammar(m))
 	if err != nil {
 		return "", nil, err
 	}
@@ -76,6 +81,29 @@ func parseCommand(m *extension.Manifest, command string) (string, []byte, error)
 	return toolName, argsJSON, nil
 }
 
+// flagGrammar 是扩展工具 DSL 的 flag 语法：按 manifest 声明，非 boolean 参数（以及
+// --json 逃生口）是取值 flag。parseCommand 读、canonicalCommand 写都用它，规范串才能
+// 被原样解析回同一组参数。
+func flagGrammar(m *extension.Manifest) cmdline.Option {
+	return cmdline.WithValueFlags(func(verb, name string) bool {
+		if name == "json" {
+			// 逃生口永远带一个值，空格分隔式与其它取值 flag 一致。
+			return true
+		}
+		def, ok := toolDef(m, verb)
+		if !ok {
+			return false
+		}
+		props, _ := def.Parameters["properties"].(map[string]any)
+		prop, ok := props[name].(map[string]any)
+		if !ok {
+			return false
+		}
+		typ, _ := prop["type"].(string)
+		return typ != "boolean"
+	})
+}
+
 // canonicalCommand 把一条命令还原为规范形式：工具名 + 按名称排序的 flag。策略匹配、
 // 审批弹窗、审计与 grant 都用它，所以同一次调用无论模型怎么排列 flag 都得到同一个串。
 func canonicalCommand(m *extension.Manifest, command string) (string, error) {
@@ -89,23 +117,35 @@ func canonicalCommand(m *extension.Manifest, command string) (string, error) {
 	}
 	c := &cmdline.Command{Verb: toolName, Flags: make(map[string]string, len(values))}
 	for name, raw := range values {
-		c.Flags[name] = flagLiteral(raw)
+		literal, ok := flagLiteral(raw)
+		if !ok {
+			// 有值 flag 写不出来（见 flagLiteral）：整组参数改用 --json 逃生口。规范串
+			// 是策略分类、审批与 grant 判的主体，它必须解析回真正执行的那组参数。
+			c.Flags = map[string]string{"json": string(argsJSON)}
+			break
+		}
+		c.Flags[name] = literal
 	}
-	return c.Render(), nil
+	return c.Render(flagGrammar(m)), nil
 }
 
 // flagLiteral 把一个已校验的参数值渲染回 flag 值文本。字符串取其内容（而不是带引号的
 // JSON），数组用逗号连接——与 convertFlag 的输入形状对称，规范串因此能被再次解析。
-func flagLiteral(raw json.RawMessage) string {
+// ok 为 false 表示 flag 写法无法无损表达这个值：空数组（"" 会解析成 [""]）或含逗号的
+// 元素（会被切开）。
+func flagLiteral(raw json.RawMessage) (string, bool) {
 	var str string
 	if err := json.Unmarshal(raw, &str); err == nil {
-		return str
+		return str, true
 	}
 	var items []string
 	if err := json.Unmarshal(raw, &items); err == nil {
-		return strings.Join(items, ",")
+		if len(items) == 0 || slices.ContainsFunc(items, func(item string) bool { return strings.Contains(item, ",") }) {
+			return "", false
+		}
+		return strings.Join(items, ","), true
 	}
-	return strings.TrimSpace(string(raw))
+	return strings.TrimSpace(string(raw)), true
 }
 
 func toolDef(m *extension.Manifest, name string) (extension.ToolDef, bool) {

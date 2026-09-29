@@ -1,6 +1,6 @@
 import { test, expect, type Page } from "@playwright/test";
 import { openAssetForm } from "../fixtures/assets";
-import { findAssetByName, findAssetPersistenceByName } from "../fixtures/db";
+import { findAssetByName, findAssetPersistenceByName, findAuditLogs, type AuditRow } from "../fixtures/db";
 
 // An extension's asset type is not a special species in the frontend: it registers
 // into the same registry as the built-in types, so the type picker, the form's
@@ -81,6 +81,58 @@ test("an extension's asset type reaches the picker and its form is generated fro
   await expect(dialog.locator(`#${CONFIG.optionalField}`)).toHaveAttribute("type", "number");
 });
 
+// notebook's asset type declares no test-connection handler (opskat.AssetType
+// .TestConnection in the guest SDK — see docs/specs 测试连接), so the button the
+// generic AssetForm shows for every *testable* type (SSH, database, …) must not
+// render at all for it; it is not merely disabled.
+test("an extension asset type without a test-connection handler shows no Test connection button", async ({
+  page,
+}) => {
+  await openApp(page);
+  await pickExtensionType(page);
+
+  await expect(page.getByTestId("asset-form-dialog").getByTestId("asset-test-connection")).toHaveCount(0);
+});
+
+// The positive side of the two declarations above, against the harness's second
+// extension (pkg/extension/testdata/fixture-ext): its asset type declares
+// connection: {sshTunnel} and a test-connection handler that GETs the asset's
+// format:"endpoint" field through host IO (docs/specs 网络与连接 / 测试连接). The form
+// must render the host's connection section with exactly the declared item, and the
+// button must run the handler on the form's current values and report the outcome.
+test("an extension asset type declaring an SSH tunnel and a test-connection handler gets the host's connection section and a working Test connection", async ({
+  page,
+  baseURL,
+}) => {
+  await openApp(page);
+  await openAssetForm(page);
+  await page.getByTestId("asset-type-picker").click();
+  const option = page.getByTestId("asset-type-option-fixture");
+  await expect(option).toBeVisible({ timeout: EXT_READY });
+  await option.click();
+  const dialog = page.getByTestId("asset-form-dialog");
+
+  // connection.sshTunnel adds an SSH tunnel choice to the host's one connection-method
+  // selector; proxyChain is not declared, so the chain choice is absent.
+  const method = dialog.getByRole("radiogroup", { name: "连接方式" });
+  await expect(method.getByRole("radio")).toHaveText(["直连", "SSH 隧道"]);
+  await method.getByRole("radio", { name: "SSH 隧道" }).click();
+  await expect(dialog.getByTestId("extension-ssh-tunnel-select")).toBeVisible();
+  await method.getByRole("radio", { name: "直连" }).click();
+
+  // The endpoint is the app's own dev server: the host dials it (a loopback address,
+  // admitted because it is the asset's endpoint) and the handler sees its 200.
+  const testButton = dialog.getByTestId("asset-test-connection");
+  await dialog.locator("#endpoint").fill(baseURL!);
+  await testButton.click();
+  await expect(page.locator('[data-sonner-toast][data-type="success"]')).toContainText("连接成功");
+
+  // Nothing listens on the discard port: the handler's dial error is the failure shown.
+  await dialog.locator("#endpoint").fill("http://127.0.0.1:9");
+  await testButton.click();
+  await expect(page.locator('[data-sonner-toast][data-type="error"]')).toContainText("连接失败");
+});
+
 test("a saved extension asset persists its schema config and renders the detail card from it", async ({
   page,
 }) => {
@@ -142,4 +194,127 @@ test("the extension's policy card offers its ext: groups and referencing one per
       timeout: 10_000,
     })
     .toEqual([`ext:${EXT}:read`, `ext:${EXT}:no-delete`, `ext:${EXT}:write`]);
+});
+
+// Task 8: a call the notebook page makes against its own asset (via
+// window.__OPSKAT_EXT__.api.callTool in extensions/notebook/frontend/page.js)
+// clears the exact same policy check / in-app approval / grant / audit gate
+// opsctl's delegated exec runs through (internal/app/opsctl's handleExtToolExec →
+// RunPageToolCall), not a direct dial into the plugin. notebook's own policy
+// groups make the three decisions reachable without touching the AI path at all:
+// "read" is granted by default (no dialog), "write" is not (needs the same
+// opsctl:approval dialog opsctl/AI use), "delete" is denied outright by a default
+// group (no dialog, straight to an error).
+async function createNotebookAssetAndOpenPage(page: Page, name: string): Promise<void> {
+  await pickExtensionType(page);
+  await page.getByTestId("asset-form-name-input").fill(name);
+  await page.getByTestId("asset-form-dialog").locator(`#${CONFIG.requiredField}`).fill(name);
+  await page.getByTestId("asset-form-submit").click();
+  await expect(page.getByTestId("asset-form-dialog")).toBeHidden();
+  await expect.poll(() => findAssetByName(name)?.type, { timeout: 10_000 }).toBe(EXT);
+
+  await page.getByTestId("asset-tree").getByText(name, { exact: true }).dblclick();
+  await expect(page.getByTestId("notebook-page")).toBeVisible({ timeout: 15_000 });
+}
+
+// The page also calls note_list on mount and after every note_put/note_delete to
+// refresh its own list — those calls clear the same gate too (as they must: they
+// are asset-scoped calls like any other) and land their own "allow" audit rows.
+// Asserting on a plain row *count* for tool_name "exec" would therefore couple
+// this spec to the page's own refresh behavior rather than to the one call under
+// test, so audit rows are picked out by which tool they ran (the normalized
+// command's leading verb) instead.
+function auditRowsForTool(assetName: string, tool: string): AuditRow[] {
+  return findAuditLogs({ assetName, toolName: "exec" }).filter((row) => row.command.startsWith(tool));
+}
+
+async function waitForToolAuditRowCount(
+  assetName: string,
+  tool: string,
+  count: number,
+  opts: { timeout?: number } = {}
+): Promise<AuditRow[]> {
+  let rows: AuditRow[] = [];
+  await expect
+    .poll(
+      () => {
+        rows = auditRowsForTool(assetName, tool);
+        return rows.length;
+      },
+      { timeout: opts.timeout ?? 15_000 }
+    )
+    .toBe(count);
+  return rows;
+}
+
+test("a page call needing confirmation shows the opsctl approval dialog; approving with 'remember' runs it, audits source extension_page, and the grant is honored on the next call", async ({
+  page,
+}) => {
+  await openApp(page);
+  const name = `e2e-extpage-put-${Date.now()}`;
+  await createNotebookAssetAndOpenPage(page, name);
+
+  const key = "runbook-1";
+  await page.getByTestId("notebook-key-input").fill(key);
+  await page.getByTestId("notebook-content-input").fill("first version");
+  await page.getByTestId("notebook-put-button").click();
+
+  // note_put is not covered by a default policy group, so it lands on NeedConfirm
+  // — the same "opsctl:approval" dialog an opsctl or AI-initiated call would get.
+  await expect(page.getByTestId("opsctl-approval-dialog")).toBeVisible({ timeout: 15_000 });
+  await page.getByRole("button", { name: "记住此操作" }).click();
+  await page.getByRole("button", { name: "批准" }).click();
+
+  await expect(page.getByTestId("notebook-status")).toHaveAttribute("data-kind", "success", { timeout: 15_000 });
+  await expect(page.getByTestId(`notebook-note-${key}`)).toBeVisible();
+
+  // The page also renders the note list through window.__OPSKAT_EXT__.hostUI.QueryResultTable
+  // (task 11's @opskat/host-ui, hostABI 2.1) — proving the host's own result-table
+  // component, not a copy, is what the injected module actually hands to the page.
+  await expect(page.getByTestId("notebook-table").getByText(key)).toBeVisible();
+
+  const [putRow] = await waitForToolAuditRowCount(name, "note_put", 1);
+  expect(putRow).toMatchObject({ source: "extension_page", decision: "allow" });
+
+  // The "always allow" grant just persisted is keyed by (action, resource) —
+  // ext:notebook:write:runbook-1 — not by session or invocation id, so a second
+  // call writing the same key must clear the gate without a dialog at all.
+  await page.getByTestId("notebook-content-input").fill("second version");
+  await page.getByTestId("notebook-put-button").click();
+  await expect(page.getByTestId("opsctl-approval-dialog")).not.toBeVisible();
+  await expect(page.getByTestId("notebook-status")).toHaveAttribute("data-kind", "success", { timeout: 15_000 });
+
+  const [, secondPutRow] = await waitForToolAuditRowCount(name, "note_put", 2);
+  expect(secondPutRow).toMatchObject({ source: "extension_page", decision: "allow" });
+});
+
+test("a page call denied by a default policy group returns an error to the page, with no dialog, and is audited", async ({
+  page,
+}) => {
+  await openApp(page);
+  const name = `e2e-extpage-deny-${Date.now()}`;
+  await createNotebookAssetAndOpenPage(page, name);
+
+  // A note must exist to have a Delete button to click; note_put still needs one
+  // approval first (the same NeedConfirm path the other test covers).
+  const key = "runbook-2";
+  await page.getByTestId("notebook-key-input").fill(key);
+  await page.getByTestId("notebook-content-input").fill("to be deleted");
+  await page.getByTestId("notebook-put-button").click();
+  await expect(page.getByTestId("opsctl-approval-dialog")).toBeVisible({ timeout: 15_000 });
+  await page.getByTestId("opsctl-approval-allow").click();
+  await expect(page.getByTestId(`notebook-note-${key}`)).toBeVisible({ timeout: 15_000 });
+
+  // note_delete is refused by the "no-delete" group, which is a default — the
+  // policy decision is Deny, not NeedConfirm, so no approval dialog is possible;
+  // the page must get an error back, and the note must survive.
+  await page.getByTestId(`notebook-delete-${key}`).click();
+  await expect(page.getByTestId("opsctl-approval-dialog")).not.toBeVisible();
+  await expect(page.getByTestId("notebook-status")).toHaveAttribute("data-kind", "error", { timeout: 15_000 });
+  await expect(page.getByTestId(`notebook-note-${key}`)).toBeVisible();
+
+  const [putRow] = await waitForToolAuditRowCount(name, "note_put", 1);
+  expect(putRow).toMatchObject({ source: "extension_page", decision: "allow" });
+  const [deleteRow] = await waitForToolAuditRowCount(name, "note_delete", 1);
+  expect(deleteRow).toMatchObject({ source: "extension_page", decision: "deny" });
 });

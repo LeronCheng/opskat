@@ -46,9 +46,14 @@ const (
 	// cost is negligible.
 	defaultMaxInstanceCalls = 512
 	// defaultToolTimeout is the ceiling for tool / policy / config calls, which
-	// are request-response. Actions are long-running by design and take their
+	// are request-response. A tool may declare its own in describe() (up to
+	// MaxToolTimeout). Actions are long-running by design and take their
 	// deadline from the caller's context instead.
 	defaultToolTimeout = 30 * time.Second
+	// defaultMaxResultBytes caps a tool result handed back to the caller. A
+	// result over it fails the call: a truncated result would be read as a
+	// complete one by the model or page that asked.
+	defaultMaxResultBytes = 16 << 20
 )
 
 // Plugin represents a loaded WASM extension.
@@ -65,14 +70,15 @@ type Plugin struct {
 	pool   chan *instance
 	closed atomic.Bool
 
-	// actions maps an in-flight action's invocation id to its cancellation flag.
+	// actions maps an in-flight action's invocation id to its invocation.
 	// Keyed by id rather than held as a single field because several actions of
 	// one extension run at the same time and each is canceled on its own.
 	actionsMu sync.Mutex
-	actions   map[string]*ActionCancellation
+	actions   map[string]*invocation
 
-	// callSeq names invocations that nobody cancels — tools, policy and config
-	// calls. They still need an id because the guest may emit events from them.
+	// callSeq names invocations the caller supplies no id for — tools, policy
+	// and config calls, which are canceled through their context rather than by
+	// id. They still need an id because the guest may emit events from them.
 	callSeq atomic.Uint64
 }
 
@@ -80,6 +86,7 @@ type pluginOptions struct {
 	maxInstances     int
 	maxInstanceCalls int
 	toolTimeout      time.Duration
+	maxResultBytes   int
 }
 
 // PluginOption customizes plugin execution.
@@ -95,9 +102,15 @@ func WithMaxInstanceCalls(n int) PluginOption {
 	return func(o *pluginOptions) { o.maxInstanceCalls = n }
 }
 
-// WithToolTimeout sets the ceiling for tool / policy / config calls.
+// WithToolTimeout sets the ceiling for tool / policy / config calls; a tool's
+// own timeout from describe() replaces it for that tool.
 func WithToolTimeout(d time.Duration) PluginOption {
 	return func(o *pluginOptions) { o.toolTimeout = d }
+}
+
+// WithMaxResultBytes sets the largest tool result returned to a caller.
+func WithMaxResultBytes(n int) PluginOption {
+	return func(o *pluginOptions) { o.maxResultBytes = n }
 }
 
 // instance is one reactor module instance plus its exported entry points.
@@ -116,6 +129,7 @@ func LoadPlugin(ctx context.Context, manifest *Manifest, wasmBytes []byte, host 
 		maxInstances:     defaultMaxInstances,
 		maxInstanceCalls: defaultMaxInstanceCalls,
 		toolTimeout:      defaultToolTimeout,
+		maxResultBytes:   defaultMaxResultBytes,
 	}
 	for _, opt := range opts {
 		opt(&o)
@@ -157,7 +171,7 @@ func LoadPlugin(ctx context.Context, manifest *Manifest, wasmBytes []byte, host 
 		host:     host,
 		opts:     o,
 		pool:     make(chan *instance, o.maxInstances),
-		actions:  make(map[string]*ActionCancellation),
+		actions:  make(map[string]*invocation),
 	}
 	for i := 0; i < o.maxInstances; i++ {
 		p.pool <- nil
@@ -184,6 +198,13 @@ type AssetRef struct {
 	ID   int64  `json:"id"`
 	Name string `json:"name"`
 	Type string `json:"type"`
+	// AdHoc, when set, means this call is not scoped to ID's row in the
+	// database — a "test connection" call, always ad-hoc (see
+	// AdHocAssetConfig) — and every host function that would otherwise read
+	// the asset's config, endpoints or dial path from storage reads them
+	// from here instead. It never crosses the WASM boundary (json:"-"): the
+	// guest sees only id/name/type, exactly as for a saved asset.
+	AdHoc *AdHocAssetConfig `json:"-"`
 }
 
 // callEnvelope is the input of execute_tool and execute_action: what to run, its
@@ -199,12 +220,67 @@ type callEnvelope struct {
 
 // CallTool calls execute_tool on the extension, scoped to asset (nil when the
 // caller has no asset).
+//
+// Every caller of a tool — AI exec, opsctl, the extension's own page — ends up
+// here, so this is where the tool's timeout and the result size limit hold for
+// all of them. Canceling ctx interrupts the call, host IO included.
 func (p *Plugin) CallTool(ctx context.Context, toolName string, args json.RawMessage, asset *AssetRef) (json.RawMessage, error) {
 	input, err := json.Marshal(callEnvelope{Tool: toolName, Args: args, Asset: asset})
 	if err != nil {
 		return nil, fmt.Errorf("marshal %s input: %w", "execute_tool", err)
 	}
-	return p.call(ctx, newInvocation(p.nextInvocationID(), nil).scopedTo(asset), "execute_tool", input, p.opts.toolTimeout)
+	out, err := p.call(ctx, newInvocation(p.nextInvocationID(), nil).scopedTo(asset), "execute_tool", input, p.toolTimeout(toolName))
+	if err != nil {
+		return nil, err
+	}
+	if len(out) > p.opts.maxResultBytes {
+		return nil, fmt.Errorf("tool %s returned %d bytes, over the host's %d-byte result limit — narrow the request (filter, page, limit) instead of fetching it all at once",
+			toolName, len(out), p.opts.maxResultBytes)
+	}
+	return out, nil
+}
+
+// testConnectionEnvelope is the input of test_connection: the asset type to
+// test (an extension may register several) and its guest-visible config.
+type testConnectionEnvelope struct {
+	AssetType string          `json:"assetType"`
+	Config    json.RawMessage `json:"config"`
+}
+
+// TestConnection runs assetType's describe()-declared test-connection
+// handler against adhoc — the asset form's submitted values, never a row read
+// from the database (see AdHocAssetConfig): a new asset has no row yet, and a
+// saved one being tested must use its unsaved edits, not what is on disk.
+//
+// It shares CallTool's instance pool and call framing (host IO the handler
+// opens is gated and dialed exactly like a tool's, scoped to adhoc instead of
+// a stored asset) but is dispatched to "test_connection", not "execute_tool",
+// and — unlike every tool call — never goes through policy: testing a
+// connection is not an operation on the asset (see docs/specs 测试连接).
+func (p *Plugin) TestConnection(ctx context.Context, assetType string, adhoc *AdHocAssetConfig) error {
+	input, err := json.Marshal(testConnectionEnvelope{AssetType: assetType, Config: adhoc.Config})
+	if err != nil {
+		return fmt.Errorf("marshal test_connection input: %w", err)
+	}
+	// Name carries assetType rather than a real asset name: there may be no
+	// saved asset at all, and every error/log site that reads AssetRef.Name
+	// (e.g. DefaultHostProvider.resolveAuth's failure message) still needs
+	// something to identify the call by.
+	ref := &AssetRef{Name: assetType, Type: assetType, AdHoc: adhoc}
+	_, err = p.call(ctx, newInvocation(p.nextInvocationID(), nil).scopedTo(ref), "test_connection", input, p.opts.toolTimeout)
+	return err
+}
+
+// toolTimeout is the deadline for one call of toolName: its own declaration from
+// describe(), or the plugin default. An unknown name gets the default; the guest
+// reports it as unknown.
+func (p *Plugin) toolTimeout(toolName string) time.Duration {
+	for _, t := range p.manifest.Tools {
+		if t.Name == toolName && t.TimeoutMs > 0 {
+			return t.Timeout()
+		}
+	}
+	return p.opts.toolTimeout
 }
 
 // CallAction calls execute_action on the extension.
@@ -223,13 +299,13 @@ func (p *Plugin) CallAction(ctx context.Context, invocationID, actionName string
 		return nil, fmt.Errorf("marshal %s input: %w", "execute_action", err)
 	}
 
-	cancel := NewActionCancellation()
-	if err := p.trackAction(invocationID, cancel); err != nil {
+	inv := newInvocation(invocationID, NewActionCancellation()).scopedTo(asset)
+	if err := p.trackAction(inv); err != nil {
 		return nil, err
 	}
 	defer p.untrackAction(invocationID)
 
-	return p.call(ctx, newInvocation(invocationID, cancel).scopedTo(asset), "execute_action", input, 0)
+	return p.call(ctx, inv, "execute_action", input, 0)
 }
 
 // CancelAction requests cancellation of the one action running under
@@ -238,12 +314,12 @@ func (p *Plugin) CallAction(ctx context.Context, invocationID, actionName string
 // which one.
 func (p *Plugin) CancelAction(invocationID string) bool {
 	p.actionsMu.Lock()
-	cancel, ok := p.actions[invocationID]
+	inv, ok := p.actions[invocationID]
 	p.actionsMu.Unlock()
 	if !ok {
 		return false
 	}
-	cancel.Cancel()
+	inv.stop()
 	return true
 }
 
@@ -251,13 +327,13 @@ func (p *Plugin) CancelAction(invocationID string) bool {
 // rejected rather than overwritten: two runs sharing one id would make both
 // cancellation and event routing ambiguous, which is the bug this id exists to
 // remove.
-func (p *Plugin) trackAction(invocationID string, cancel *ActionCancellation) error {
+func (p *Plugin) trackAction(inv *invocation) error {
 	p.actionsMu.Lock()
 	defer p.actionsMu.Unlock()
-	if _, exists := p.actions[invocationID]; exists {
-		return fmt.Errorf("action invocation %q is already running", invocationID)
+	if _, exists := p.actions[inv.id]; exists {
+		return fmt.Errorf("action invocation %q is already running", inv.id)
 	}
-	p.actions[invocationID] = cancel
+	p.actions[inv.id] = inv
 	return nil
 }
 
@@ -271,8 +347,8 @@ func (p *Plugin) untrackAction(invocationID string) {
 func (p *Plugin) cancelAllActions() {
 	p.actionsMu.Lock()
 	defer p.actionsMu.Unlock()
-	for _, c := range p.actions {
-		c.Cancel()
+	for _, inv := range p.actions {
+		inv.stop()
 	}
 }
 
@@ -310,8 +386,15 @@ func (p *Plugin) CheckPolicy(ctx context.Context, toolName string, args json.Raw
 	return decision.Action, decision.Resource, nil
 }
 
-// ValidateConfig calls validate_config on the extension.
+// ValidateConfig calls validate_config on the extension. config is the asset's
+// config exactly as about to be persisted, which may carry the host's reserved
+// connection-settings key (proxy chain, TLS) — stripped here, before it ever
+// crosses into guest code, the same as ctx.AssetConfig() strips it.
 func (p *Plugin) ValidateConfig(ctx context.Context, config json.RawMessage) ([]ValidationError, error) {
+	config, err := StripHostConnectionConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("strip host connection config: %w", err)
+	}
 	result, err := p.call(ctx, newInvocation(p.nextInvocationID(), nil), "validate_config", config, p.opts.toolTimeout)
 	if err != nil {
 		return nil, err
@@ -374,7 +457,16 @@ func (p *Plugin) call(ctx context.Context, inv *invocation, fnName string, input
 	// how a host call finds the invocation it belongs to.
 	guestCtx := withInvocation(callCtx, inv)
 
+	// CloseOnContextDone only stops a guest that is running bytecode. One blocked
+	// inside a host function — a TCP read with no deadline, an HTTP round trip or
+	// body read — never gets back to it, so it would ignore both the deadline and
+	// the caller's cancellation and hold its pool slot for good. Closing the
+	// invocation's handles when the context ends fails that host call instead;
+	// the guest returns into bytecode, wazero sees the context and ends the call,
+	// and release discards the instance as poisoned.
+	stopInterrupt := context.AfterFunc(callCtx, inv.close)
 	out, callErr := inst.invoke(guestCtx, req)
+	stopInterrupt()
 	inv.close()
 	p.release(callCtx, inst, callErr != nil)
 

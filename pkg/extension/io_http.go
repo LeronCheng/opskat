@@ -4,10 +4,12 @@ package extension
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 
@@ -16,8 +18,6 @@ import (
 
 	"github.com/opskat/opskat/internal/pkg/netdial"
 )
-
-type dialContextFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 
 // resolveFunc resolves a hostname for a dial network (tcp / tcp4 / tcp6).
 type resolveFunc func(ctx context.Context, network, host string) ([]net.IP, error)
@@ -29,7 +29,7 @@ type resolveFunc func(ctx context.Context, network, host string) ([]net.IP, erro
 //
 // With allowPrivate there is nothing to check: addr goes to dial untouched, so an SSH
 // tunnel resolves it on the remote side instead of failing on a name only it knows.
-func dialGuard(dial dialContextFunc, resolve resolveFunc, allowPrivate bool) dialContextFunc {
+func dialGuard(dial DialContextFunc, resolve resolveFunc, allowPrivate bool) DialContextFunc {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		if allowPrivate {
 			return dial(ctx, network, addr)
@@ -74,9 +74,6 @@ const (
 	httpPhaseClosed
 )
 
-// DialFunc is a custom dialer for HTTP transports (e.g. SSH tunnel).
-type DialFunc func(network, addr string) (net.Conn, error)
-
 type httpHandle struct {
 	mu      sync.Mutex
 	client  *http.Client
@@ -88,41 +85,123 @@ type httpHandle struct {
 	bodyBuf *bytes.Buffer // buffered request body (for POST/PUT/PATCH)
 	resp    *http.Response
 	phase   httpPhase
-	hasBody bool // true for POST/PUT/PATCH
+	hasBody bool         // true for POST/PUT/PATCH
+	auth    *requestAuth // credentials injected into endpoint hops; nil = none
+	// redirectGuard vets where this request may be redirected; nil = anywhere.
+	// Like auth it rides on the request, not the client: a cached client is
+	// shared by later calls, whose guard may differ from the call that built it.
+	redirectGuard func(*url.URL) error
 }
 
 // newHTTPHandle creates an HTTP handle ready for writing (POST/PUT/PATCH)
-// or immediate flushing (GET/HEAD/DELETE/OPTIONS).
-func newHTTPHandle(params IOOpenParams, dial DialFunc) (*httpHandle, error) {
+// or immediate flushing (GET/HEAD/DELETE/OPTIONS) to a target that is not an
+// asset's endpoint. Its client is single-use: no later call reads its pool, so
+// it keeps no connection alive past the call. For an asset's endpoint, see
+// buildCachedHTTPClient / buildSingleUseEndpointClient.
+func newHTTPHandle(params IOOpenParams) (*httpHandle, error) {
+	transport := newHTTPTransport(nil, nil, params.AllowPrivate)
+	transport.DisableKeepAlives = true
+	return newHandleFromClient(params, newHTTPClient(transport, false), nil)
+}
+
+// buildCachedHTTPClient builds an *http.Client meant to be reused across many
+// calls to the same asset (see DefaultHostProvider.httpClients). dial keeps
+// its own per-dial context — supplied by the transport at the time it
+// actually needs a new connection — since the transport may open one long
+// after the call that first built it has returned, to serve a different,
+// later call. Nothing a call decides — its credentials, where it may be
+// redirected — is built in: each request carries its own (see
+// httpHandle.Flush).
+func buildCachedHTTPClient(dial DialContextFunc, tlsConfig *tls.Config, allowPrivate bool) *http.Client {
+	return newHTTPClient(newEndpointTransport(dial, tlsConfig, allowPrivate), tlsConfig != nil)
+}
+
+// buildSingleUseEndpointClient is buildCachedHTTPClient for a call nothing will
+// ever reuse a client for (an ad-hoc test-connection call): its connection —
+// possibly an SSH session to a jump host behind it — closes with the call
+// instead of idling in a pool no one reads again.
+func buildSingleUseEndpointClient(dial DialContextFunc, tlsConfig *tls.Config, allowPrivate bool) *http.Client {
+	transport := newEndpointTransport(dial, tlsConfig, allowPrivate)
+	transport.DisableKeepAlives = true
+	return newHTTPClient(transport, tlsConfig != nil)
+}
+
+// newEndpointTransport is the transport to an asset's endpoint. The host owns
+// that connection path (direct, SSH tunnel, proxy chain — see AssetDialer), so
+// the process's HTTP(S)_PROXY environment does not apply: through a tunnel the
+// transport would dial the proxy's address instead of the endpoint, and without
+// one it would hand the proxy the credentials injected for the endpoint.
+func newEndpointTransport(dial DialContextFunc, tlsConfig *tls.Config, allowPrivate bool) *http.Transport {
+	transport := newHTTPTransport(dial, tlsConfig, allowPrivate)
+	transport.Proxy = nil
+	return transport
+}
+
+// newHTTPTransport clones the default transport, wires dial through the
+// dial-time private-IP guard (catching DNS rebinding after URL-level checks),
+// and applies tlsConfig when set. dial nil means a plain outbound TCP dial
+// through netdial, so .local hosts resolve over unicast DNS instead of waiting
+// out the system resolver's mDNS timeout.
+func newHTTPTransport(dial DialContextFunc, tlsConfig *tls.Config, allowPrivate bool) *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	direct := netdial.Default()
+	baseDial := DialContextFunc(direct.DialContext)
+	if dial != nil {
+		baseDial = dial
+	}
+	transport.DialContext = dialGuard(baseDial, direct.Resolve, allowPrivate)
+	if tlsConfig != nil {
+		transport.TLSClientConfig = tlsConfig
+	}
+	return transport
+}
+
+// newHTTPClient wraps transport in an *http.Client. The client itself holds
+// neither credentials nor a redirect policy: authTransport injects only the
+// credentials a request carries on its context, and checkRedirect applies only
+// the guard the request carries there. requireTLS is set for an asset endpoint
+// whose connection settings enable TLS: authTransport then refuses plain http.
+func newHTTPClient(transport *http.Transport, requireTLS bool) *http.Client {
+	return &http.Client{Transport: &authTransport{base: transport, requireTLS: requireTLS}, CheckRedirect: checkRedirect}
+}
+
+type redirectGuardKey struct{}
+
+func withRedirectGuard(ctx context.Context, guard func(*url.URL) error) context.Context {
+	return context.WithValue(ctx, redirectGuardKey{}, guard)
+}
+
+// checkRedirect keeps net/http's own redirect limit and applies the guard the
+// request carries (net/http hands every redirect hop the first request's
+// context), which only narrows where a redirect may go.
+func checkRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	if guard, _ := req.Context().Value(redirectGuardKey{}).(func(*url.URL) error); guard != nil {
+		return guard(req.URL)
+	}
+	return nil
+}
+
+// newHandleFromClient builds the per-call handle state (method, url, headers,
+// redirect guard, its own cancelable context, body buffer) around client, which may be freshly
+// built (newHTTPHandle) or a cached one shared across calls
+// (openHTTPResourceWithClient).
+func newHandleFromClient(params IOOpenParams, client *http.Client, auth *requestAuth) (*httpHandle, error) {
 	method := strings.ToUpper(params.Method)
 	if method == "" {
 		method = "GET"
 	}
-
 	if params.URL == "" {
 		return nil, fmt.Errorf("URL is required for HTTP handle")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-
-	// Build transport; clone default so we don't mutate the global one. Direct dials
-	// go through netdial so .local hosts resolve over unicast DNS instead of waiting
-	// out the system resolver's mDNS timeout.
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	direct := netdial.Default()
-	baseDial := dialContextFunc(direct.DialContext)
-	if dial != nil {
-		baseDial = func(_ context.Context, network, addr string) (net.Conn, error) {
-			return dial(network, addr)
-		}
-	}
-	// Always wrap with the dial-time guard to catch DNS rebinding after URL-level checks.
-	transport.DialContext = dialGuard(baseDial, direct.Resolve, params.AllowPrivate)
-
 	hasBody := method == "POST" || method == "PUT" || method == "PATCH"
 
 	return &httpHandle{
-		client:  &http.Client{Transport: transport},
+		client:  client,
 		method:  method,
 		url:     params.URL,
 		headers: params.Headers,
@@ -131,6 +210,9 @@ func newHTTPHandle(params IOOpenParams, dial DialFunc) (*httpHandle, error) {
 		bodyBuf: &bytes.Buffer{},
 		phase:   httpPhaseWriting,
 		hasBody: hasBody,
+		auth:    auth,
+
+		redirectGuard: params.RedirectGuard,
 	}, nil
 }
 
@@ -161,12 +243,19 @@ func (h *httpHandle) Flush() (*IOMeta, error) {
 		body = bytes.NewReader(h.bodyBuf.Bytes())
 	}
 
+	reqCtx := h.ctx
+	if h.auth != nil {
+		reqCtx = withRequestAuth(reqCtx, h.auth)
+	}
+	if h.redirectGuard != nil {
+		reqCtx = withRedirectGuard(reqCtx, h.redirectGuard)
+	}
 	var req *http.Request
 	var err error
 	if body != nil {
-		req, err = http.NewRequestWithContext(h.ctx, h.method, h.url, body)
+		req, err = http.NewRequestWithContext(reqCtx, h.method, h.url, body)
 	} else {
-		req, err = http.NewRequestWithContext(h.ctx, h.method, h.url, nil)
+		req, err = http.NewRequestWithContext(reqCtx, h.method, h.url, nil)
 	}
 	if err != nil {
 		h.mu.Unlock()
@@ -180,12 +269,27 @@ func (h *httpHandle) Flush() (*IOMeta, error) {
 	client := h.client
 	h.mu.Unlock()
 
-	resp, err := client.Do(req) //nolint:bodyclose // body is read by Read() and closed by Close()
+	// The body is read by Read() and closed by Close() — or below, when Close
+	// already ran.
+	resp, err := client.Do(req)
 	if err != nil {
+		if h.auth != nil {
+			err = h.auth.redact(err)
+		}
 		return nil, fmt.Errorf("HTTP request failed: %w", err)
 	}
 
 	h.mu.Lock()
+	if h.phase == httpPhaseClosed {
+		// Close ran while the round trip was in flight — the invocation was
+		// interrupted — and had no response to release then. Release it here, or
+		// its body and the connection behind it stay open with no one to close them.
+		h.mu.Unlock()
+		if err := resp.Body.Close(); err != nil {
+			logger.Default().Warn("close HTTP response body of an interrupted request", zap.Error(err))
+		}
+		return nil, fmt.Errorf("HTTP request interrupted: handle closed")
+	}
 	h.resp = resp
 	h.mu.Unlock()
 
@@ -227,11 +331,34 @@ func (h *httpHandle) Close() error {
 		return nil
 	}
 	h.phase = httpPhaseClosed
-	h.cancel()
+	// Close the response body before canceling: net/http only returns a
+	// finished request's connection to the transport's keep-alive pool once
+	// the body is closed with nothing left unread. Canceling first would race
+	// that handoff and make the transport tear the connection down instead —
+	// silently defeating the whole point of caching the client for reuse.
 	if h.resp != nil {
 		if err := h.resp.Body.Close(); err != nil {
 			logger.Default().Warn("close HTTP response body", zap.Error(err))
 		}
 	}
+	h.cancel()
 	return nil
+}
+
+// openHTTPResourceWithClient prepares an HTTP request against a pre-built,
+// possibly cached client — the keep-alive-reuse counterpart of
+// OpenHTTPResource (io_handle.go), used by DefaultHostProvider.OpenIO once it
+// has resolved (or reused) the asset's client via httpClientCache. auth, when
+// set, is injected into the hops that target the asset's endpoint.
+func openHTTPResourceWithClient(params IOOpenParams, client *http.Client, auth *requestAuth) (*IOResource, error) {
+	h, err := newHandleFromClient(params, client, auth)
+	if err != nil {
+		return nil, err
+	}
+	return &IOResource{
+		Reader: &httpReadAdapter{h: h},
+		Writer: &httpWriteAdapter{h: h},
+		Closer: &httpCloseAdapter{h: h},
+		http:   h,
+	}, nil
 }

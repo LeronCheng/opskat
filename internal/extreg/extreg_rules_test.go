@@ -3,8 +3,11 @@ package extreg
 import (
 	"testing"
 
+	"github.com/cago-frame/cago/pkg/logger"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/opskat/opskat/internal/ai/aictx"
 	"github.com/opskat/opskat/internal/ai/permission"
@@ -155,4 +158,184 @@ func TestUnregisterRemovesTheRuleLandingWithoutLeaking(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, asset_entity.AssetTypeSSH, canonical,
 		"a runtime landing must never claim the shared command column's canonical type")
+}
+
+// --- 参数级策略：guest 按参数给出 (action, resource)，规则 <action>[:<glob>] ---
+
+func TestExtensionRuleWithAResourceGlobMatchesOnlyThatResource(t *testing.T) {
+	cp := &asset_entity.CommandPolicy{AllowList: []string{"object.write:prod/*"}}
+
+	registerFake(t, &fakePlugin{action: "object.write", resource: "prod/a.txt"})
+	got := permission.CheckPermission(withGrantFixturePolicy(t, 1, "acme-store", cp), "acme-store", 1, "list_objects --bucket=prod")
+	assert.Equal(t, aictx.Allow, got.Decision, "the resource the guest classified must be matched against the rule's glob")
+	assert.Equal(t, "object.write:prod/*", got.MatchedPattern)
+
+	Unregister("acme")
+	registerFake(t, &fakePlugin{action: "object.write", resource: "dev/a.txt"})
+	got = permission.CheckPermission(withGrantFixturePolicy(t, 2, "acme-store", cp), "acme-store", 2, "list_objects --bucket=prod")
+	assert.Equal(t, aictx.NeedConfirm, got.Decision, "a resource outside the glob must still ask")
+}
+
+func TestExtensionRuleWithoutAResourceMatchesAnyResource(t *testing.T) {
+	registerFake(t, &fakePlugin{action: "object.write", resource: "anything/at/all"})
+	ctx := withGrantFixturePolicy(t, 1, "acme-store", &asset_entity.CommandPolicy{
+		AllowList: []string{"object.write"},
+	})
+	got := permission.CheckPermission(ctx, "acme-store", 1, "list_objects --bucket=prod")
+	assert.Equal(t, aictx.Allow, got.Decision)
+}
+
+func TestExtensionResourceDenyBeatsAWiderAllow(t *testing.T) {
+	cp := &asset_entity.CommandPolicy{
+		AllowList: []string{"object.write"},
+		DenyList:  []string{"object.write:prod/secret*"},
+	}
+	registerFake(t, &fakePlugin{action: "object.write", resource: "prod/secret.env"})
+	got := permission.CheckPermission(withGrantFixturePolicy(t, 1, "acme-store", cp), "acme-store", 1, "list_objects --bucket=prod")
+	assert.Equal(t, aictx.Deny, got.Decision)
+
+	Unregister("acme")
+	registerFake(t, &fakePlugin{action: "object.write", resource: "prod/readme"})
+	got = permission.CheckPermission(withGrantFixturePolicy(t, 2, "acme-store", cp), "acme-store", 2, "list_objects --bucket=prod")
+	assert.Equal(t, aictx.Allow, got.Decision)
+}
+
+// deny → allow → grant → confirm：一条已批准的 grant 盖不住 deny，而 allow 在 grant 之前判定。
+func TestExtensionDecisionOrderIsDenyAllowGrantConfirm(t *testing.T) {
+	const command = "list_objects --bucket=prod"
+	cp := &asset_entity.CommandPolicy{
+		AllowList: []string{"object.write:pub/*"},
+		DenyList:  []string{"object.write:prod/*"},
+	}
+
+	registerFake(t, &fakePlugin{action: "object.write", resource: "prod/a"})
+	ctx := withGrantFixturePolicy(t, 1, "acme-store", cp)
+	permission.SaveGrantPattern(ctx, "sess-ext", 1, "acme-1", "acme-store", "ext:acme:object.write:prod/a")
+	got := permission.CheckPermission(ctx, "acme-store", 1, command)
+	assert.Equal(t, aictx.Deny, got.Decision, "a grant must not lift a deny")
+
+	Unregister("acme")
+	registerFake(t, &fakePlugin{action: "object.write", resource: "pub/a"})
+	ctx = withGrantFixturePolicy(t, 2, "acme-store", cp)
+	permission.SaveGrantPattern(ctx, "sess-ext", 2, "acme-1", "acme-store", "ext:acme:object.write:pub/a")
+	got = permission.CheckPermission(ctx, "acme-store", 2, command)
+	assert.Equal(t, aictx.Allow, got.Decision)
+	assert.Equal(t, aictx.SourcePolicyAllow, got.DecisionSource, "allow is judged before the grant")
+
+	Unregister("acme")
+	registerFake(t, &fakePlugin{action: "object.write", resource: "tmp/a"})
+	ctx = withGrantFixturePolicy(t, 3, "acme-store", cp)
+	permission.SaveGrantPattern(ctx, "sess-ext", 3, "acme-1", "acme-store", "ext:acme:object.write:tmp/a")
+	got = permission.CheckPermission(ctx, "acme-store", 3, command)
+	assert.Equal(t, aictx.Allow, got.Decision)
+	assert.Equal(t, aictx.SourceGrantAllow, got.DecisionSource, "no rule decides → the grant does")
+}
+
+// 资源 glob 与 manifest 权限组里的规则同一套语言。
+func TestExtensionPolicyGroupRulesMatchResourceGlobs(t *testing.T) {
+	m := testManifest()
+	m.Policies.Groups[0].Policy = map[string]any{"allow_list": []any{"object.write:pub/*"}}
+	l := loaded{name: m.Name, manifest: m, plugin: &fakePlugin{action: "object.write", resource: "pub/x"}}
+	require.NoError(t, register(l, "help", "desc"))
+	t.Cleanup(func() { Unregister(m.Name) })
+
+	got := permission.CheckPermission(withGrantFixture(t, 1, "acme-store"), "acme-store", 1, "list_objects --bucket=prod")
+	assert.Equal(t, aictx.Allow, got.Decision)
+}
+
+// guest 返回的 action 必须在类型声明的动作集合里；否则视为 NeedConfirm（不查 grant）并记错误。
+func TestExtensionUndeclaredActionNeedsConfirmAndIsLogged(t *testing.T) {
+	core, logs := observer.New(zap.DebugLevel)
+	origLogger := logger.Default()
+	logger.SetLogger(zap.New(core))
+	t.Cleanup(func() { logger.SetLogger(origLogger) })
+
+	const command = "list_objects --bucket=prod"
+	registerFake(t, &fakePlugin{action: "object.nuke"})
+	ctx := withGrantFixturePolicy(t, 1, "acme-store", &asset_entity.CommandPolicy{
+		AllowList: []string{"object.nuke"},
+	})
+	permission.SaveGrantPattern(ctx, "sess-ext", 1, "acme-1", "acme-store", command)
+
+	got := permission.CheckPermission(ctx, "acme-store", 1, command)
+	assert.Equal(t, aictx.NeedConfirm, got.Decision,
+		"an action the type never declared must be asked about, whatever rules or grants say")
+
+	entries := logs.FilterMessage("extension policy returned an undeclared action").All()
+	require.Len(t, entries, 1)
+	assert.Equal(t, zap.ErrorLevel, entries[0].Level)
+	fields := entries[0].ContextMap()
+	assert.Equal(t, "acme", fields["extension"])
+	assert.Equal(t, "list_objects", fields["tool"])
+	assert.Equal(t, "object.nuke", fields["action"])
+}
+
+// 动作按工具核对，不是按整个扩展的并集：一个只声明了 object.delete 的工具，guest 的
+// check_policy 却答成另一个工具才有的 object.list，就是 guest 缺陷——不能借一条
+// object.list 的 allow 规则让删除免审批。
+func TestExtensionActionMustBeDeclaredByTheCalledTool(t *testing.T) {
+	registerFake(t, &fakePlugin{action: "object.list"})
+	ctx := withGrantFixturePolicy(t, 1, "acme-store", &asset_entity.CommandPolicy{
+		AllowList: []string{"object.list"},
+	})
+
+	got := permission.CheckPermission(ctx, "acme-store", 1, "delete_bucket --bucket=prod")
+	assert.Equal(t, aictx.NeedConfirm, got.Decision,
+		"an action another tool declares must not classify a call of this tool")
+}
+
+// resource 是 guest 的任意文本，可以含 ':'。规则串在 action 之后的第一个 ':' 处切开，
+// 其后整段都是 glob；guest 既不能借 resource 伪造 action 段，也不能借带 ':' 的 action
+// 撞上一条带 glob 的规则。
+func TestExtensionResourceWithColonsCannotEscapeTheRule(t *testing.T) {
+	cp := &asset_entity.CommandPolicy{AllowList: []string{"object.write:prod"}}
+
+	registerFake(t, &fakePlugin{action: "object.write", resource: "prod:extra"})
+	got := permission.CheckPermission(withGrantFixturePolicy(t, 1, "acme-store", cp), "acme-store", 1, "list_objects --bucket=prod")
+	assert.Equal(t, aictx.NeedConfirm, got.Decision, "a resource is matched whole against the glob, not split on ':'")
+
+	Unregister("acme")
+	registerFake(t, &fakePlugin{action: "object.write:prod"})
+	got = permission.CheckPermission(withGrantFixturePolicy(t, 2, "acme-store", cp), "acme-store", 2, "list_objects --bucket=prod")
+	assert.Equal(t, aictx.NeedConfirm, got.Decision, "an action carrying ':' is undeclared, never an action plus a resource")
+
+	Unregister("acme")
+	registerFake(t, &fakePlugin{action: "object.write", resource: "a:b"})
+	got = permission.CheckPermission(withGrantFixturePolicy(t, 3, "acme-store", &asset_entity.CommandPolicy{
+		AllowList: []string{"object.write:a:*"},
+	}), "acme-store", 3, "list_objects --bucket=prod")
+	assert.Equal(t, aictx.Allow, got.Decision, "a glob may itself spell ':' to match such a resource")
+}
+
+func TestExtensionRuleLandsWithAResourceGlob(t *testing.T) {
+	registerFake(t, &fakePlugin{})
+
+	asset := &asset_entity.Asset{ID: 1, Name: "acme-1", Type: "acme-store"}
+	landed, err := permission.AppendTypeRules(asset, "acme-store", permission.RuleAllow, []string{"object.list:prod-*"})
+	require.NoError(t, err)
+	assert.Equal(t, []permission.LandedRule{{Rule: "object.list:prod-*"}}, landed)
+
+	for _, bad := range []string{"object.nuke:prod-*", "object.list:", "object.list:[", ":prod"} {
+		_, err := permission.AppendTypeRules(asset, "acme-store", permission.RuleAllow, []string{bad})
+		assert.Error(t, err, "%q must be refused before it lands", bad)
+	}
+}
+
+func TestExtensionDenyShadowingUnderstandsResourceGlobs(t *testing.T) {
+	registerFake(t, &fakePlugin{})
+	view := func(deny ...string) *permission.TypeRuleView {
+		v := &permission.TypeRuleView{}
+		for _, d := range deny {
+			v.Deny = append(v.Deny, permission.SourcedRule{Rule: d})
+		}
+		return v
+	}
+
+	assert.NotNil(t, permission.ShadowingDeny(view("object.write"), "acme-store", "object.write:prod/*"),
+		"a deny without a resource covers every resource of the action")
+	assert.NotNil(t, permission.ShadowingDeny(view("object.write:prod/*"), "acme-store", "object.write:prod/a"),
+		"a deny whose glob covers the landed resource shadows it")
+	assert.Nil(t, permission.ShadowingDeny(view("object.write:prod/*"), "acme-store", "object.write"),
+		"a deny on some resources does not shadow an allow on all of them")
+	assert.Nil(t, permission.ShadowingDeny(view("object.write:prod/*"), "acme-store", "object.list:prod/a"))
 }

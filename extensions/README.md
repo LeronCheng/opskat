@@ -41,11 +41,17 @@ Everything else — tools, asset types, policies, pages, display strings — is 
 {
   "name": "notebook",
   "version": "0.1.0",
-  "hostABI": "2.0",
+  "hostABI": "2.1",
   "backend": { "runtime": "wasm", "binary": "main.wasm" },
   "capabilities": {}
 }
 ```
+
+`hostABI` is checked as an exact-set membership, not a minimum: `pkg/extension.SupportedHostABIs`
+currently accepts `2.0` and `2.1`, so an already-built `2.0` extension keeps loading
+unchanged (it just doesn't get `@opskat/host-ui` — see below), while one declaring
+anything not in that set (`2.2`, `3.0`, …) is refused at load with the list of what is
+supported.
 
 `capabilities` defaults to deny-all, and the notebook needs nothing: the host KV, the
 asset config and logging are available without a grant. Declare only what you use:
@@ -55,7 +61,8 @@ asset config and logging are available without a grant. Declare only what you us
   "fs":   { "read": ["${EXT_DIR}/**"], "write": ["/var/tmp/myext/**"] },
   "http": { "allowlist": ["https://api.example.com/"] },
   "credentials": "read",
-  "tunnel": true
+  "tunnel": true,
+  "network": { "assetEndpoint": true }
 }
 ```
 
@@ -63,7 +70,15 @@ Each one is enforced at the host call it guards: `fs` patterns are absolute path
 prefixes (`${EXT_DIR}` resolves to the installed extension's directory), the `http`
 allowlist is matched as a URL prefix and private/loopback destinations are refused
 unless `tunnel` is also granted, and `credentials: "read"` is what lets
-`ctx.AssetConfig()` return decrypted password fields.
+`ctx.AssetConfig()` return decrypted password fields (see
+[Reading secret fields](#reading-secret-fields)). `network.assetEndpoint` lets a
+call scoped to an asset reach the addresses in that asset's config fields tagged
+`format:"endpoint"` (a URL or `host:port`) over HTTP and TCP — private addresses
+included, since the user typed them. The target's scheme, host and port must match
+an endpoint field (a bare `host:port` admits http and https); anything else, a
+redirect off the endpoints included, is refused with "not an endpoint of the asset".
+Declaring it also puts TCP under that rule; without it TCP is ungated and HTTP reach
+is the static allowlist alone.
 
 **Everything else is answered by the module itself**, through `describe()`. You never
 write that answer: the SDK derives it from the registration calls, so the host's view
@@ -117,7 +132,8 @@ type putArgs struct {
 - `desc` on a **tool** argument is shown to the model as written — plain text, not an
   i18n key. On an **asset config** field, `title` / `placeholder` / `desc` are i18n
   keys, and `format:"password"` marks a secret the host encrypts, `enum:"a,b"` renders
-  a select.
+  a select. Declare a secret as an `opskat.Credential` field, which is always
+  `format:"password"` (see [Reading secret fields](#reading-secret-fields)).
 
 ### The asset comes from the host, not from the arguments
 
@@ -126,7 +142,7 @@ envelope and the handler reads it off the context:
 
 ```go
 func listNotes(ctx *opskat.ToolContext, args listArgs) (any, error) {
-    raw, err := ctx.AssetConfig() // config of the exec target, passwords decrypted
+    raw, err := ctx.AssetConfig() // config of the exec target
     ...                           // ctx.Asset is {ID, Name, Type}
 }
 ```
@@ -139,31 +155,206 @@ never granted — there is no "the flag wins" case to reason about.
 `ctx.AssetConfig()` only ever reads the call's own asset, and only when that asset's
 type is one this extension registers; there is no by-id lookup, so an extension cannot
 read a builtin asset or another extension's. It fails when the call is not scoped to an
-asset. That happens for
-the one caller that legitimately has none: the asset configuration form runs an
-extension **action** (`test_connection`) on a configuration that has not been saved
-yet. An extension page that *does* work on a saved asset passes its `assetId` prop —
+asset. (The asset form's "Test connection" on an unsaved configuration is not such a
+call: it runs the type's declared handler with the submitted config — see
+[Test connection](#test-connection).) An extension page that *does* work on a saved asset passes its `assetId` prop —
 `api.callTool(ext, tool, args, assetId)` / `api.executeAction(ext, action, args,
 onEvent, assetId)` — and the handler reads it from `ctx.Asset` the same way.
+`api.callTool` against a saved asset clears the exact same policy check / in-app
+approval dialog / grant / audit trail as `opsctl exec` on that asset does — a call
+needing confirmation pops the app's usual approval dialog, and a denial reaches the
+page as a rejected promise, not a result to display.
+
+### Connection settings belong to the host
+
+Tunnels, proxy chains and TLS are not config fields you define and handle yourself.
+An asset type names the ones it supports, and the host shows them on the asset form
+and detail card and applies them when the extension dials the asset's endpoint:
+
+```go
+opskat.AssetType[esConfig]("es").Connection(opskat.Connection{SSHTunnel: true, ProxyChain: true, TLS: true})
+```
+
+With `SSHTunnel` declared, the form offers the same SSH-asset picker built-in types
+use; the choice is stored on the asset, never in its config, so `ctx.AssetConfig()`
+and the config validator never see it. `ProxyChain` offers the same multi-hop
+SSH/SOCKS5/HTTP-tunnel builder built-in types use, and `TLS` offers the same
+enable / skip-verify / server name / CA / client cert & key fields — both are stored
+in a host-reserved key inside the asset's config JSON, stripped before
+`ctx.AssetConfig()` and the config validator ever see it, for the same reason the
+tunnel choice is kept off the asset: an extension has no legitimate reason to read
+settings it cannot itself apply. HTTP and TCP opens to the asset's endpoint are dialed
+through the declared tunnel/chain and wrapped in the declared TLS, and an endpoint's
+hostname is resolved on the far side of a tunnel; anything else the same call reaches
+(an allowlisted public API) is dialed directly. Since these settings apply only to the
+endpoint, declaring any of them needs `network.assetEndpoint` and a `format:"endpoint"`
+config field — the host refuses the extension at load otherwise. A cert file that cannot be read, a
+failed TLS handshake, or a chain hop that cannot be reached all fail the open with
+the host's error; there is no fallback to a direct or unverified connection — with TLS
+enabled, a plain `http://` request to the endpoint is refused, and the process's
+`HTTP(S)_PROXY` never reroutes an endpoint request. With both
+`SSHTunnel` and `ProxyChain` declared, an asset uses one or the other — an SSH jump host
+goes into the chain as a hop — and one that sets both is refused rather than dialed
+without the tunnel. An item left undeclared is neither shown nor applied, and the host
+refuses a `connection` item it does not know.
+
+### Credentials are injected by the host
+
+An HTTP extension does not need to hold its asset's password. The asset type declares
+how a request authenticates, and the host renders that from the asset's config —
+decrypting `format:"password"` fields itself — into every request the extension sends
+to the asset's endpoint (redirect hops that stay on it included):
+
+```go
+opskat.AssetType[esConfig]("es").Auth(opskat.Auth{
+	Selector: "authType", // config field that picks the group; omit for a single group
+	Groups: []opskat.AuthGroup{
+		{When: "basic", Bindings: []opskat.AuthBinding{{In: "basic", Value: "{{username}}:{{password}}"}}},
+		{When: "apiKey", Bindings: []opskat.AuthBinding{
+			{In: "header", Name: "Authorization", Value: `ApiKey {{base64(apiKeyId, ":", apiKey)}}`},
+		}},
+		{When: "token", Bindings: []opskat.AuthBinding{{In: "query", Name: "access_token", Value: "{{token}}"}}},
+	},
+})
+```
+
+`In` is `header` (`Name` is the header), `query` (`Name` is the parameter) or `basic`
+(no `Name`; `Value` renders `user:password` and is sent as `Authorization: Basic …`).
+`Value` is literal text with `{{field}}` and `{{base64(part, …)}}` placeholders, each
+part a config field or a double-quoted literal; a field the config leaves unset renders
+empty. A `Selector` value no group names injects nothing (e.g. `authType: "none"`).
+The host refuses the extension at load when a template references a field the config
+does not declare, the selector is a `format:"password"` field, or a group cannot be
+selected unambiguously, and — like
+`Connection` — when the manifest lacks `network.assetEndpoint` or the config has no
+`format:"endpoint"` field: requests to any target other than the asset's endpoint get
+no credentials. The injected values never reach the guest — not in the response metadata
+and not in a failed request's error; a `TRACE`, which a server answers by echoing the
+request, is refused when it would carry them — and a password that cannot be decrypted
+fails the request instead of sending it unauthenticated. A `query` binding replaces a
+same-name parameter and leaves the rest of the query exactly as the extension wrote it. `credentials: "read"` stays for
+protocols the host cannot authenticate for you (raw TCP handshakes); the install
+confirmation and the extension's details in Settings warn about it prominently.
+
+### Reading secret fields
+
+Declare a secret config field as `opskat.Credential`. The asset form shows it as a
+password, and it decodes from `ctx.AssetConfig()` whether or not the extension may read
+it:
+
+```go
+type esConfig struct {
+	Endpoint string            `json:"endpoint" format:"endpoint"`
+	Username string            `json:"username,omitempty"`
+	Password opskat.Credential `json:"password,omitempty" title:"config.password.title"`
+}
+
+raw, err := ctx.AssetConfig()
+...
+var cfg esConfig
+if err := json.Unmarshal(raw, &cfg); err != nil {
+	return nil, err
+}
+cfg.Password.IsSet()                // the asset has a password, readable or not
+password, err := cfg.Password.Plaintext()
+```
+
+Without `credentials: "read"`, the host serves the field as an opaque handle that
+carries no plaintext: `IsSet` still reports whether the asset has a value, `Plaintext`
+fails with `opskat.ErrCredentialWithheld`, and the host keeps injecting the secret through
+`Auth`. With `credentials: "read"`, `Plaintext` returns the decrypted value (`""` when
+unset). A plain `string` field tagged `format:"password"` decodes only the plaintext, so
+it suits only an extension that declares `credentials: "read"`. Without it,
+`json.Unmarshal` fails on the handle. `Credential` is refused as a tool argument; a secret
+belongs on the asset. `TestConnection` decodes the form into the same struct, and there,
+without `credentials: "read"`, a secret field the host withheld arrives unset.
+
+### Test connection
+
+The asset form's "Test connection" button appears only when the asset type declares
+a handler for it:
+
+```go
+opskat.AssetType[esConfig]("es").TestConnection(func(cfg esConfig) error {
+	h, err := opskat.IOOpen("http", map[string]any{"method": "GET", "url": cfg.Endpoint})
+	if err != nil {
+		return err
+	}
+	defer h.Close()
+	meta, err := h.Flush()
+	if err != nil {
+		return err
+	}
+	if meta.Status >= 400 {
+		return fmt.Errorf("unexpected status %d", meta.Status)
+	}
+	return nil
+})
+```
+
+`fn` receives the form's current values decoded into the same config struct
+`AssetType` reflected the schema from — including for a brand-new, not-yet-saved
+asset — and reaches the endpoint exactly like a tool does (`IOOpen`, `Dial`, an
+`*http.Client` on `NewHTTPTransport`), gated and dialed by `network.assetEndpoint`
+and any declared `Connection` / `Auth` the same way, but resolved from the form's
+submitted connection settings (tunnel, proxy chain, TLS) rather than a saved
+asset's row: what is under test is exactly what the caller is about to save, or
+never will. A nil error means success. Test connection never goes through policy —
+it is not an operation on the asset — and, editing a saved asset, a password field
+the user has left untouched is filled in from the stored value before `fn` runs (one
+the user cleared is tested empty, as it will be saved); the plaintext never reaches
+the frontend to do this.
 
 ### The policy face
 
-Every tool declares the action it requests through `.Policy(action)`. The host does
-not take that as permission: it matches the action against the permission groups
-granted on the asset, and the answer is one of three.
+Every tool declares the action it requests. A tool whose action is fixed uses
+`.Policy(action)` — optionally with `.Resource(fn)` to report what the call touches.
+A tool whose action depends on its arguments classifies each call with
+`.PolicyFunc(actions, fn)`: `fn(args)` returns the action and a resource (any string,
+possibly empty), and `actions` is every action `fn` can return.
 
-- an action in a granted group's **allow** list runs unattended;
-- an action in a granted group's **deny** list is refused, and a denial beats every
-  allow;
-- anything else **asks the user**, and "always allow" saves a grant.
+```go
+opskat.Tool("note_put", putNote).
+    PolicyFunc([]string{"write"}, func(args putArgs) (string, string) {
+        return "write", strings.TrimSpace(args.Key)
+    })
+```
+
+The host does not take the classification as permission: it matches the action and
+resource against the rules on the asset and the permission groups granted on it, in
+this order — **deny → allow → grant → ask**.
+
+- a matching **deny** rule refuses the call, and a denial beats every allow;
+- a matching **allow** rule runs it unattended;
+- otherwise a grant saved by an earlier "always allow" runs it;
+- anything else **asks the user**.
+
+A rule is `<action>` or `<action>:<resource-glob>`. A rule without a resource covers
+the action on every resource; a glob uses the same `path.Match` semantics as command
+rules (`*` does not cross `/`) and is matched against the whole resource, which may
+itself contain `:` — the rule is split at the first `:` only. Group allow/deny lists
+hold rules in this form, and so do the permanent allow/deny rules users write on an
+asset (its detail page, or `opsctl policy allow|deny`, e.g.
+`opsctl policy allow my-notes -- 'write:runbook/*'`) or on an asset group
+(`opsctl policy … --group`, kept per policy type). Action names therefore may not
+contain `:` or whitespace.
+A grant request for an extension asset — the AI's `request_permission`, or one delivered
+over the opsctl approval channel (opsctl has no user-facing grant command) — is written
+the same way (`write:runbook/*`, or `write` for every resource) and is stored as
+`ext:<PolicyType>:<rule>`, so the next call it covers runs without asking. A
+command-shaped pattern (`note_put *`) or an undeclared action is refused rather than
+stored as a grant nothing would ever match. The help the host generates for the
+extension's asset type lists each tool's action and this format for the model.
+
+An action `fn` returns that the extension never declared is a defect, not a
+decision: the host logs an error and asks the user, without consulting rules or grants.
 
 `.Default()` marks a group granted to every new asset of the extension's types.
 Group ids must be namespaced by the extension's policy type — `ext:<PolicyType>:<group>`.
-Users can also write permanent allow/deny rules — plain action names — on an asset
-(its detail page, or `opsctl policy allow|deny`) or on an asset group
-(`opsctl policy … --group`, kept per policy type). A policy type belongs to one extension: loading a second extension that claims the same
+A policy type belongs to one extension: loading a second extension that claims the same
 policy type, or a group id that is already registered, is refused. The action set itself
-is never declared — the host derives it from the tools.
+is never declared separately — the host derives it from the tools' `.Policy` actions
+and `.PolicyFunc` action sets.
 
 ## SKILL.md and locales
 
@@ -220,13 +411,44 @@ result, err := host.CallTool(asset, "note_put", putArgs{Key: "k", Content: "v"})
 
 `WithMockHTTP`, `WithMockTCP` and `WithActionCancel` stand in for the other host
 capabilities; `CallAction` captures the events an action emits, and `CheckPolicy`
-returns the action a call requests.
+returns the action and resource a call requests.
 
 ## Frontend pages (optional)
 
 `opskat.Frontend(...)` declares an ESM entry the app loads from
 `/extensions/<name>/<entry>`, served straight out of the installed extension
 directory. A page slotted as `asset.connect` is what opening the asset shows. The app
-injects `window.__OPSKAT_EXT__` (`React`, `ReactDOM`, `i18n`, `@opskat/ui`, and the
-extension API) before importing the module, so a page uses the host's React rather
-than bundling its own.
+injects `window.__OPSKAT_EXT__` (`React`, `ReactDOM`, `i18n`, `@opskat/ui`,
+`@opskat/host-ui` — see below — and the extension API) before importing the module,
+so a page uses the host's React rather than bundling its own. There is no import map
+for bare specifiers: a plain ESM page (no build step, like `extensions/notebook`)
+reads everything off `window.__OPSKAT_EXT__` directly, e.g.
+`const { React, hostUI } = window.__OPSKAT_EXT__;` — see `extensions/notebook/frontend/page.js`.
+
+### `@opskat/host-ui`
+
+`window.__OPSKAT_EXT__.hostUI` gives a page three ready-made, on-theme components
+instead of bundling its own (design decision in
+[docs/specs/2026-09-24-ext-platform-capabilities.md](../docs/specs/2026-09-24-ext-platform-capabilities.md)):
+
+- `CodeEditor` — Monaco, with a selectable `language` (including `"json"`).
+- `JsonTreeView` — a read-only, expand/collapse JSON tree for `data` of any shape.
+- `QueryResultTable` — a `columns` / `rows` result grid with sorting and copy built in.
+
+They are the *exact same component instances* the host itself renders, so they
+already follow the host's theme (CSS variables flip with `ThemeProvider`, no prop
+needed) and language (the shared `react-i18next` instance) — a page just renders
+them:
+
+```js
+const { React, hostUI } = window.__OPSKAT_EXT__;
+const { createElement: h } = React;
+h(hostUI.QueryResultTable, { columns: ["key", "size"], rows: notes });
+h(hostUI.JsonTreeView, { data: someNote });
+```
+
+`hostUI.version` is bound to `hostABI` (currently `"2.1"`) — it tells a page which
+host-ui revision it's running against. Declare `"hostABI": "2.1"` in your own
+manifest once your page uses `hostUI`: that is the contract you are relying on, and
+it is what keeps a future host free to drop `hostUI` behind a still-higher ABI
+without silently breaking a `2.0` extension that never touched it.

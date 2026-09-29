@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -262,4 +263,66 @@ func TestHandleExtDevInstallWithoutExtensionSystem(t *testing.T) {
 
 	require.False(t, resp.Approved)
 	require.Contains(t, resp.Reason, "extension system")
+}
+
+// network.assetEndpoint lets the extension reach private addresses named in asset
+// config, so the user must see it before approving, and turning it on in a rebuild
+// is a new decision.
+func TestHandleExtDevInstallShowsAssetEndpointCapability(t *testing.T) {
+	approver := &recordingApprover{approve: true}
+	o := newDevOpsctl(&recordingDevInstaller{}, approver)
+	dir := devExtensionDir(t, "oss", "")
+
+	require.True(t, o.handleExtDevInstall(approval.ApprovalRequest{Path: dir}).Approved)
+	require.NotContains(t, approver.prompts[0].Detail, "network.assetEndpoint")
+
+	manifest := `{
+  "name": "oss", "version": "1.2.3", "hostABI": "2.0",
+  "backend": {"runtime": "wasm", "binary": "main.wasm"},
+  "capabilities": {"credentials": "", "http": {"allowlist": ["https://api.example.com/"]}, "network": {"assetEndpoint": true}}
+}`
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "manifest.json"), []byte(manifest), 0o600))
+	require.True(t, o.handleExtDevInstall(approval.ApprovalRequest{Path: dir}).Approved)
+
+	require.Len(t, approver.prompts, 2, "declaring network.assetEndpoint must prompt again")
+	require.Contains(t, approver.prompts[1].Detail, "network.assetEndpoint: true")
+}
+
+// A dev extension declaring a hostABI newer than this runtime supports (e.g. one
+// built against a future host-ui revision) is refused at the same install gate a
+// stale 1.x extension already is — not installed silently with hostUI missing.
+func TestHandleExtDevInstallRefusesNewerHostABI(t *testing.T) {
+	approver := &recordingApprover{approve: true}
+	o := newDevOpsctl(&recordingDevInstaller{}, approver)
+	dir := t.TempDir()
+	manifest := `{
+  "name": "oss", "version": "1.2.3", "hostABI": "2.2",
+  "backend": {"runtime": "wasm", "binary": "main.wasm"},
+  "capabilities": {}
+}`
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "manifest.json"), []byte(manifest), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "main.wasm"), []byte("wasm"), 0o600))
+
+	resp := o.handleExtDevInstall(approval.ApprovalRequest{Path: dir})
+
+	require.False(t, resp.Approved)
+	require.Contains(t, resp.Reason, "hostABI")
+	require.Empty(t, approver.prompts, "a rejected manifest must not reach the approval prompt")
+}
+
+// credentials:read hands the extension every stored password of its assets in
+// plaintext, so the approval leads with it instead of listing it among the
+// other capabilities.
+func TestHandleExtDevInstallLeadsWithCredentialsReadWarning(t *testing.T) {
+	approver := &recordingApprover{approve: true}
+	o := newDevOpsctl(&recordingDevInstaller{}, approver)
+
+	require.True(t, o.handleExtDevInstall(approval.ApprovalRequest{Path: devExtensionDir(t, "oss", "read")}).Approved)
+	require.True(t, o.handleExtDevInstall(approval.ApprovalRequest{Path: devExtensionDir(t, "plain", "")}).Approved)
+
+	require.Len(t, approver.prompts, 2)
+	withRead := strings.SplitN(approver.prompts[0].Detail, "\n", 2)[0]
+	require.Contains(t, withRead, "credentials: read")
+	require.Contains(t, withRead, "plaintext")
+	require.NotContains(t, approver.prompts[1].Detail, "plaintext")
 }

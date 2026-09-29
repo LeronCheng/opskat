@@ -12,6 +12,7 @@ vi.mock("../../wailsjs/go/extension/Extension", () => ({
   ),
   CallExtensionTool: vi.fn(async () => "{}"),
   CancelExtensionAction: vi.fn(async () => undefined),
+  CancelExtensionTool: vi.fn(async () => undefined),
 }));
 
 type Listener = (payload: unknown) => void;
@@ -27,7 +28,12 @@ vi.mock("../../wailsjs/runtime/runtime", () => ({
   EventsOff: vi.fn((name: string) => listeners.delete(name)),
 }));
 
-import { CallExtensionAction, CallExtensionTool, CancelExtensionAction } from "../../wailsjs/go/extension/Extension";
+import {
+  CallExtensionAction,
+  CallExtensionTool,
+  CancelExtensionAction,
+  CancelExtensionTool,
+} from "../../wailsjs/go/extension/Extension";
 import { createExtensionAPI } from "../extension/api";
 
 function emit(payload: { extension: string; invocationId: string; eventType: string; data: unknown }) {
@@ -117,14 +123,74 @@ describe("extension action API", () => {
     const api = createExtensionAPI();
 
     await api.callTool("notebook", "note_list", {}, 12);
-    expect(CallExtensionTool).toHaveBeenCalledWith("notebook", "note_list", "{}", 12);
+    expect(CallExtensionTool).toHaveBeenCalledWith("notebook", "note_list", "{}", expect.any(String), 12);
 
     await api.callTool("notebook", "note_list", {});
-    expect(CallExtensionTool).toHaveBeenLastCalledWith("notebook", "note_list", "{}", 0);
+    expect(CallExtensionTool).toHaveBeenLastCalledWith("notebook", "note_list", "{}", expect.any(String), 0);
 
     const run = api.startAction("notebook", "sync", {}, undefined, 12);
     expect(CallExtensionAction).toHaveBeenCalledWith("notebook", "sync", "{}", run.invocationId, 12);
     pendingCalls.get(run.invocationId)?.("{}");
     await run.result;
+  });
+
+  // The invocation id is what CancelExtensionTool names: it must be a real,
+  // call-unique token, not an empty string or a constant reused across calls
+  // (either of which would let one call's abort stop another, or be refused by
+  // the backend outright). The "always allow" grant session is not derived from
+  // it — the backend keys that on the asset.
+  it("mints a distinct invocation id for each callTool call", async () => {
+    const api = createExtensionAPI();
+
+    await api.callTool("notebook", "note_put", { key: "a" }, 12);
+    await api.callTool("notebook", "note_put", { key: "b" }, 12);
+
+    const [firstCall, secondCall] = (CallExtensionTool as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+    const firstInvocationId = firstCall[3];
+    const secondInvocationId = secondCall[3];
+    expect(firstInvocationId).toEqual(expect.any(String));
+    expect(firstInvocationId).not.toBe("");
+    expect(firstInvocationId).not.toEqual(secondInvocationId);
+  });
+
+  // A page that stops waiting (navigates away, the user hits stop) aborts its
+  // signal; the backend call is canceled by the id this call was made under, so
+  // the guest — and any host IO it is blocked in — is interrupted instead of
+  // holding one of the extension's few instance slots until it finishes.
+  it("cancels the backend call when the caller aborts", async () => {
+    let rejectCall: (err: Error) => void = () => undefined;
+    vi.mocked(CallExtensionTool).mockImplementationOnce(
+      () => new Promise<string>((_resolve, reject) => (rejectCall = reject))
+    );
+    vi.mocked(CancelExtensionTool).mockImplementationOnce(async () => rejectCall(new Error("context canceled")));
+    const api = createExtensionAPI();
+    const controller = new AbortController();
+
+    const call = api.callTool("es", "search", { q: "*" }, 12, { signal: controller.signal });
+    controller.abort();
+
+    await expect(call).rejects.toMatchObject({ name: "AbortError" });
+    const invocationId = vi.mocked(CallExtensionTool).mock.calls[0][3];
+    expect(CancelExtensionTool).toHaveBeenCalledWith(invocationId);
+  });
+
+  it("does not start a call whose signal is already aborted", async () => {
+    const api = createExtensionAPI();
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(api.callTool("es", "search", {}, 12, { signal: controller.signal })).rejects.toMatchObject({
+      name: "AbortError",
+    });
+    expect(CallExtensionTool).not.toHaveBeenCalled();
+  });
+
+  it("returns the result of a call that finishes before its signal is aborted", async () => {
+    const api = createExtensionAPI();
+    const controller = new AbortController();
+
+    await expect(api.callTool("es", "search", {}, 12, { signal: controller.signal })).resolves.toEqual({});
+    controller.abort();
+    expect(CancelExtensionTool).not.toHaveBeenCalled();
   });
 });

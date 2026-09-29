@@ -16,6 +16,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 
@@ -30,6 +31,7 @@ import (
 	"github.com/opskat/opskat/internal/model/entity/asset_entity"
 	policyent "github.com/opskat/opskat/internal/model/entity/policy"
 	"github.com/opskat/opskat/internal/model/entity/policy_group_entity"
+	"github.com/opskat/opskat/internal/service/conntest"
 	"github.com/opskat/opskat/pkg/extension"
 )
 
@@ -44,7 +46,36 @@ type pluginCaller interface {
 	CallTool(ctx context.Context, toolName string, args json.RawMessage, asset *extension.AssetRef) (json.RawMessage, error)
 	CheckPolicy(ctx context.Context, toolName string, args json.RawMessage) (action, resource string, err error)
 	ValidateConfig(ctx context.Context, config json.RawMessage) ([]extension.ValidationError, error)
+	TestConnectionCaller
 }
+
+// TestConnectionCaller is the one plugin capability a conntest tester needs:
+// run an asset type's describe()-declared test-connection handler. It is its
+// own (exported) interface, not folded silently into pluginCaller, because
+// ConnTestRegistrar — implemented outside this package — needs a type it can
+// name in its own signature; Go only requires the method sets to match.
+type TestConnectionCaller interface {
+	TestConnection(ctx context.Context, assetType string, adhoc *extension.AdHocAssetConfig) error
+}
+
+// ConnTestRegistrar builds the conntest.TestFunc a describe()-declared
+// test-connection handler is registered under. The one implementation
+// (internal/app/extension, wired once from main.go via SetConnTestRegistrar)
+// needs extension_svc and credential_svc to merge the form's unchanged
+// password fields with an edited asset's stored ones — internal/extreg
+// cannot import either without an import cycle (extension_svc already calls
+// extreg.Register), so the capability is injected instead of implemented here.
+type ConnTestRegistrar interface {
+	Build(extName string, manifest *extension.Manifest, assetType string, plugin TestConnectionCaller) conntest.TestFunc
+}
+
+var connTestRegistrar ConnTestRegistrar
+
+// SetConnTestRegistrar wires the registrar main.go constructs at startup,
+// before any extension loads. Called more than once, the last call wins —
+// there is exactly one desktop process wiring this, same as every other
+// setter-injected seam in main.go.
+func SetConnTestRegistrar(r ConnTestRegistrar) { connTestRegistrar = r }
 
 // loaded 是一个已加载扩展在本包内的最小画像。
 type loaded struct {
@@ -57,9 +88,9 @@ var (
 	mu         sync.Mutex
 	registered = make(map[string][]string) // extension name → registered asset types
 	// policyTypeOwner 记录每个策略面（manifest 的 policies.type）归哪个扩展。策略面是
-	// 权限组 ID（ext:<policyType>:<name>）与永久规则（ext:<policyType>:<action>）共同的
-	// 命名空间段，也是 CheckExtensionPolicy 筛权限组的键：两个扩展共用一个策略面，
-	// 一方的组与规则就会被当成另一方的来判。
+	// 权限组 ID（ext:<policyType>:<name>）的命名空间段、组上扩展永久规则的落点键，也是
+	// CheckExtensionPolicy 筛权限组的键：两个扩展共用一个策略面，一方的组与规则就会被
+	// 当成另一方的来判。
 	policyTypeOwner = make(map[string]string) // policy type → extension name
 )
 
@@ -148,10 +179,14 @@ func Unregister(name string) {
 
 func registerType(l loaded, at extension.AssetTypeDef, help, description string) error {
 	m := l.manifest
+	// 测试连接要跑 WASM，只有桌面进程接了 registrar；先查，免得登记到一半再回滚。
+	if at.TestConnection && connTestRegistrar == nil {
+		return fmt.Errorf("extension %q: asset type %q declares a test-connection handler but no registrar is wired", l.name, at.Type)
+	}
 	if err := assettype.RegisterExtensionType(extensionTypeSpec(l.name, m, at)); err != nil {
 		return fmt.Errorf("extension %q: %w", l.name, err)
 	}
-	if err := permission.RegisterPolicyCheck(at.Type, policyCheck(l, at.Type)); err != nil {
+	if err := permission.RegisterPolicyCheck(at.Type, policyCheck(l, at.Type), classifyForApproval(l)); err != nil {
 		assettype.Unregister(at.Type)
 		return fmt.Errorf("extension %q: %w", l.name, err)
 	}
@@ -170,7 +205,7 @@ func registerType(l loaded, at extension.AssetTypeDef, help, description string)
 		return fmt.Errorf("extension %q: %w", l.name, err)
 	}
 	// 永久规则落点：opsctl policy allow/deny/rm/show 走它，规则形状
-	// `ext:<policyType>:<action>`，落在共用的 CommandPolicy 列上。
+	// `<action>[:<resource-glob>]`，按策略面落在资产 / 组各自的列上（rule_ext.go）。
 	if err := permission.RegisterExtensionRuleSink(at.Type, m.Policies.Type, m.Policies.Actions); err != nil {
 		assettype.Unregister(at.Type)
 		permission.UnregisterPolicyCheck(at.Type)
@@ -193,6 +228,11 @@ func registerType(l loaded, at extension.AssetTypeDef, help, description string)
 	policyent.RegisterDefaultPolicy(at.Type, func() any {
 		return &policyent.CommandPolicy{Groups: defaults}
 	})
+	// 测试连接：仅当 describe() 声明了处理器时才登记，且只在这条(而非
+	// RegisterDescribeOnly)路径——测试连接要跑 WASM，opsctl 进程没有运行时。
+	if at.TestConnection {
+		conntest.Register(at.Type, connTestRegistrar.Build(l.name, m, at.Type, l.plugin))
+	}
 	return nil
 }
 
@@ -228,6 +268,8 @@ func unregisterType(assetType string) {
 	skills.UnregisterDynamic(assetType)
 	policyent.UnregisterDefaultPolicy(assetType)
 	asset_entity.UnregisterConfigValidator(assetType)
+	// 无条件调用：未声明测试连接处理器的类型从未在这张表里出现过，Unregister 对它是空操作。
+	conntest.Unregister(assetType)
 }
 
 // skillDescription 是技能清单里的那一行。优先用 SKILL.md frontmatter 的 description，
@@ -298,48 +340,96 @@ func execTool(l loaded) permission.ExecFunc {
 }
 
 // policyCheck 是扩展类型的策略判定，形状与内置类型的 check* 函数一致：
-// 类型策略 → grant → NeedConfirm。
+// 类型策略（deny → allow）→ grant → NeedConfirm。
 //
 // 与内置类型的差别只在中间那一步的语言：内置类型把命令文本拿去撞规则模式，扩展则先问
-// guest 的 check_policy 这条调用请求的是哪个 action，再拿 action 去撞 holder 自身那一列
-// 与它引用的权限组里的精确 allow/deny 名单（policy.CheckExtensionPolicy）。两套引擎
-// 不合并，是因为它们判定的根本不是同一种东西。
+// guest 的 check_policy 这条调用按参数分类成哪个 (action, resource)，再拿它去撞 holder
+// 自身那一列与它引用的权限组里的 `<action>[:<resource-glob>]` 规则
+// （policy.CheckExtensionPolicy）。两套引擎不合并，是因为它们判定的根本不是同一种东西。
+//
+// guest 给出的 action 必须属于被调用工具在 describe() 里声明的动作（ToolDef.Actions，
+// 不是整个扩展的 policies.actions 并集）。集合外的 action——包括空串、带 ':' 想冒充 "动作:资源" 的串——
+// 是 guest 的缺陷：记一条错误，直接 NeedConfirm，既不撞规则也不查 grant，让用户看见
+// 这次调用本身。
 //
 // 返回 NeedConfirm 之后发生什么，则与内置类型完全一致：CheckForAsset 弹审批框，
-// "全部允许"落 grant，下一条同样的命令由这里的 MatchGrant 直接放行。
+// "全部允许"落 grant，下一条同样的调用由这里的 MatchExtensionGrant 直接放行。
 func policyCheck(l loaded, assetType string) permission.PolicyCheckFunc {
 	return func(ctx context.Context, assetID int64, command string) aictx.CheckResult {
-		toolName, argsJSON, err := parseCommand(l.manifest, command)
-		if err != nil {
-			// 到不了这里：canonicalize 已经用同一个解析器跑过一遍。真发生了就是
-			// fail-closed 的 NeedConfirm，而不是放行。
+		action, resource, _, _, ok := classifyCommand(ctx, l, command)
+		if !ok {
 			return aictx.CheckResult{Decision: aictx.NeedConfirm}
 		}
-		action, _, err := l.plugin.CheckPolicy(ctx, toolName, argsJSON)
-		if err != nil {
-			logger.Ctx(ctx).Warn("extension policy check failed",
-				zap.String("extension", l.name), zap.String("tool", toolName))
-			return aictx.CheckResult{Decision: aictx.NeedConfirm}
+		policyType := l.manifest.Policies.Type
+		groups, own := permission.ExtensionPolicyForAsset(ctx, assetID, policyType)
+		if len(groups) == 0 {
+			groups = l.manifest.Policies.Default
 		}
-		if action != "" {
-			policyType := l.manifest.Policies.Type
-			groups, own := permission.ExtensionPolicyForAsset(ctx, assetID, policyType)
-			if len(groups) == 0 {
-				groups = l.manifest.Policies.Default
-			}
-			result := aipolicy.CheckExtensionPolicy(ctx, aipolicy.ExtensionCheck{
-				PolicyType: policyType,
-				GroupIDs:   groups,
-				Own:        own,
-				Action:     action,
-			})
-			if result.Decision != aictx.NeedConfirm {
-				return result
-			}
+		result := aipolicy.CheckExtensionPolicy(ctx, aipolicy.ExtensionCheck{
+			PolicyType: policyType,
+			GroupIDs:   groups,
+			Own:        own,
+			Action:     action,
+			Resource:   resource,
+		})
+		if result.Decision != aictx.NeedConfirm {
+			return result
 		}
-		if granted, ok := permission.MatchGrant(ctx, assetID, command, assetType); ok {
+		// Matched by classification (action, resource), not by re-parsing command:
+		// two calls that spell the same request differently — different flag order,
+		// an equivalent literal — must hit the same grant (spec 参数级策略 › 审批展示).
+		if granted, ok := permission.MatchExtensionGrant(ctx, assetID, assetType, policyType, action, resource); ok {
 			return granted
 		}
 		return aictx.CheckResult{Decision: aictx.NeedConfirm}
+	}
+}
+
+// classifyCommand parses a command and runs the guest's check_policy classification,
+// validating the action against the actions the called tool declares
+// (ToolDef.Actions) — not the extension-wide union, so one tool cannot answer with
+// an action only another tool may request.
+// It is the single place policyCheck and classifyForApproval both call, so "undeclared
+// action never classifies" can't drift between the check path and the approval/grant
+// path — both must see the same failure the same way.
+func classifyCommand(ctx context.Context, l loaded, command string) (action, resource, toolName string, argsJSON json.RawMessage, ok bool) {
+	toolName, argsJSON, err := parseCommand(l.manifest, command)
+	if err != nil {
+		// 到不了这里：canonicalize 已经用同一个解析器跑过一遍。真发生了就是
+		// fail-closed 的"分类失败"，而不是放行或落 grant。
+		return "", "", "", nil, false
+	}
+	action, resource, err = l.plugin.CheckPolicy(ctx, toolName, argsJSON)
+	if err != nil {
+		logger.Ctx(ctx).Warn("extension policy check failed",
+			zap.String("extension", l.name), zap.String("tool", toolName))
+		return "", "", "", nil, false
+	}
+	def, _ := toolDef(l.manifest, toolName)
+	if !slices.Contains(def.Actions(), action) {
+		logger.Ctx(ctx).Error("extension policy returned an undeclared action",
+			zap.String("extension", l.name), zap.String("tool", toolName), zap.String("action", action))
+		return "", "", "", nil, false
+	}
+	return action, resource, toolName, argsJSON, true
+}
+
+// classifyForApproval adapts classifyCommand to permission.ClassifyFunc: it is the
+// grant-pattern producer HandleConfirm calls to show an approval item's Action/
+// Resource/Detail and to build the "always allow" grant key (spec 参数级策略 ›
+// 审批展示 — grant persisted as ext:<type>:<action>:<resource>).
+func classifyForApproval(l loaded) permission.ClassifyFunc {
+	return func(ctx context.Context, command string) (permission.ExtensionClassification, bool) {
+		action, resource, toolName, argsJSON, ok := classifyCommand(ctx, l, command)
+		if !ok {
+			return permission.ExtensionClassification{}, false
+		}
+		return permission.ExtensionClassification{
+			PolicyType: l.manifest.Policies.Type,
+			Action:     action,
+			Resource:   resource,
+			Tool:       toolName,
+			Args:       argsJSON,
+		}, true
 	}
 }

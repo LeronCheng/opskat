@@ -14,6 +14,17 @@ type ApprovalItem struct {
 	GroupName string `json:"group_name,omitempty"`
 	Command   string `json:"command"`
 	Detail    string `json:"detail,omitempty"`
+	// Action / Resource are set only for extension types registered with a
+	// ClassifyFunc (type_registry.go): the check_policy classification of Command,
+	// shown next to it so approving means approving a legible (action, resource)
+	// pair rather than only an opaque exec string (spec 参数级策略 › 审批展示).
+	Action   string `json:"action,omitempty"`
+	Resource string `json:"resource,omitempty"`
+	// RememberPattern is set together with Action: the "<action>:<resource-glob>"
+	// tail an "always allow" persists as ext:<type>:<tail> (resource glob-escaped, so
+	// untouched it grants only the resource shown). The "Remember" editor pre-fills
+	// and edits this instead of Command; an edited value must keep "<action>:".
+	RememberPattern string `json:"remember_pattern,omitempty"`
 }
 
 // ApprovalResponse 统一审批响应
@@ -118,7 +129,26 @@ func ParseApprovalResponse(kind string, resp ApprovalResponse, expectedItems ...
 				}
 				normalized[i] = want
 				normalized[i].Command = item.Command
-				changed = changed || item.Command != want.Command
+				proposed := want.Command
+				if want.Action != "" {
+					// A classified extension item's Remember value is its grant tail,
+					// not its command text (see ApprovalItem.RememberPattern).
+					if err := validateExtGrantEdit(want.Action, item.Command); err != nil {
+						return ParsedApprovalResponse{Decision: ApprovalDeny},
+							fmt.Errorf("approval edited_items[%d]: %w", i, err)
+					}
+					proposed = want.RememberPattern
+				}
+				if kind == ApprovalKindGrant {
+					// A grant request item for an extension asset carries the extension
+					// type (SubmitGrantMulti / opsctl approval channel): its edit must stay in rule
+					// syntax, or it would persist a grant nothing ever matches.
+					if _, isExt, err := extensionGrantFor(want.Type, item.Command); isExt && err != nil {
+						return ParsedApprovalResponse{Decision: ApprovalDeny},
+							fmt.Errorf("approval edited_items[%d]: %w", i, err)
+					}
+				}
+				changed = changed || item.Command != proposed
 			}
 			// EditedItems is also the origin signal for grant normalization. Old or
 			// forged frontends may echo every unchanged item; treat that as no edit so

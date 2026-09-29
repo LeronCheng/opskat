@@ -147,6 +147,97 @@ describe("ApprovalBlock", () => {
     expect(screen.getByTestId("ai-approval-allow")).toBeInTheDocument();
   });
 
+  it("扩展审批（kind=single 带 action/resource）显示动作、资源，请求详情可折叠", () => {
+    renderApproval({
+      approvalKind: "single",
+      approvalItems: [
+        {
+          type: "acme-store",
+          asset_id: 1,
+          asset_name: "s3-prod",
+          command: "list_objects --bucket=prod",
+          action: "object.write",
+          resource: "prod-bucket",
+          detail: '{\n  "tool": "list_objects",\n  "args": {\n    "bucket": "prod"\n  }\n}',
+        },
+      ],
+    });
+
+    expect(screen.getByText("object.write")).toBeInTheDocument();
+    expect(screen.getByText("prod-bucket")).toBeInTheDocument();
+    // 请求详情走既有的 <details> 折叠机制，摘要用专门的文案，不是传输/删除的文案。
+    const summary = screen.getByText("ai.approvalRequestDetail");
+    expect(summary.closest("details")).not.toBeNull();
+    expect(screen.getByText(/"tool": "list_objects"/)).toBeInTheDocument();
+  });
+
+  describe("分类过的扩展审批：「记住」编辑的是落库的 action:resource", () => {
+    const classified = {
+      type: "esverify",
+      asset_id: 3,
+      asset_name: "es-logs",
+      command: "request --body='' --method=DELETE --path=/logs-app",
+      action: "delete",
+      resource: "logs-app",
+      remember_pattern: "delete:logs-app",
+    };
+
+    it("预填 remember_pattern 而不是命令串", () => {
+      renderApproval({ approvalKind: "single", approvalItems: [classified] });
+
+      fireEvent.click(screen.getByTestId("ai-approval-remember"));
+
+      expect(screen.getByTestId("approval-remember-pattern")).toHaveValue("delete:logs-app");
+    });
+
+    it("修改后的 action:resource-glob 原样作为 edited_items 发回", () => {
+      renderApproval({ approvalKind: "single", approvalItems: [classified] });
+
+      fireEvent.click(screen.getByTestId("ai-approval-remember"));
+      fireEvent.change(screen.getByTestId("approval-remember-pattern"), { target: { value: "delete:logs-*" } });
+      fireEvent.click(screen.getByTestId("ai-approval-allow-all"));
+
+      const response = vi.mocked(RespondAIApproval).mock.calls[0]?.[1];
+      expect(response?.decision).toBe("allowAll");
+      expect(response?.edited_items?.[0].command).toBe("delete:logs-*");
+    });
+
+    it("未修改直接「记住并允许」不伪造 edited_items", () => {
+      renderApproval({ approvalKind: "single", approvalItems: [classified] });
+
+      fireEvent.click(screen.getByTestId("ai-approval-remember"));
+      fireEvent.click(screen.getByTestId("ai-approval-allow-all"));
+
+      const response = vi.mocked(RespondAIApproval).mock.calls[0]?.[1];
+      expect(response?.decision).toBe("allowAll");
+      expect(response?.edited_items).toBeUndefined();
+    });
+
+    it("去掉或改动动作时提示错误且不能提交", () => {
+      renderApproval({ approvalKind: "single", approvalItems: [classified] });
+
+      fireEvent.click(screen.getByTestId("ai-approval-remember"));
+      fireEvent.change(screen.getByTestId("approval-remember-pattern"), { target: { value: "*" } });
+
+      expect(screen.getByTestId("approval-remember-pattern-error")).toHaveTextContent(
+        "opsctlApproval.classificationPatternActionRequired"
+      );
+      expect(screen.getByTestId("ai-approval-allow-all")).toBeDisabled();
+      fireEvent.click(screen.getByTestId("ai-approval-allow-all"));
+      expect(RespondAIApproval).not.toHaveBeenCalled();
+    });
+  });
+
+  it("普通命令（无 action/resource）不显示动作/资源行", () => {
+    renderApproval({
+      approvalKind: "single",
+      approvalItems: [{ type: "exec", asset_id: 1, asset_name: "web-1", command: "ls -la" }],
+    });
+
+    expect(screen.queryByText("ai.approvalActionLabel")).not.toBeInTheDocument();
+    expect(screen.queryByText("ai.approvalResourceLabel")).not.toBeInTheDocument();
+  });
+
   it("oss 审批项有自己的徽章图标，不回落到通用的终端图标", () => {
     renderApproval({
       approvalKind: "single",

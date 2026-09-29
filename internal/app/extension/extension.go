@@ -13,6 +13,23 @@ type LangProvider interface {
 	Lang() string
 }
 
+// PageToolGate runs one tool call an extension's own frontend page makes against
+// the asset it was opened for, through the same policy check / in-app approval /
+// grant / audit gate opsctl's socket bridge runs delegated exec commands through
+// (main.go wires *opsctl.Opsctl in, whose RunPageToolCall implements this).
+//
+// Without this seam, CallExtensionTool would have to call straight into
+// Plugin.CallTool — the direct-dial path opsctl.handleExtToolExec exists
+// precisely to avoid, because it skips policy, approval, grant and audit
+// entirely. command is the same `<tool> --flag=value` / `<tool> --json=<...>`
+// exec DSL text the unified exec handler parses for every other caller (AI,
+// opsctl). extension is the calling extension's display name, which the approval
+// dialog names as the requester. Canceling ctx — which CancelExtensionTool does —
+// ends the call.
+type PageToolGate interface {
+	RunPageToolCall(ctx context.Context, extension string, assetID int64, command string) (string, error)
+}
+
 // Extension binder。
 type Extension struct {
 	appCtx context.Context
@@ -20,7 +37,11 @@ type Extension struct {
 	lang   LangProvider
 	pool   *sshpool.Pool
 
-	service *extension_svc.Service
+	service  *extension_svc.Service
+	pageGate PageToolGate
+
+	// toolCalls are the page tool calls in flight, for CancelExtensionTool.
+	toolCalls toolCalls
 }
 
 // New 构造 extension binder。
@@ -30,6 +51,9 @@ func New(appCtx context.Context, lang LangProvider, pool *sshpool.Pool) *Extensi
 
 // SetService main.go 在创建 extension_svc.Service 后注入。
 func (e *Extension) SetService(svc *extension_svc.Service) { e.service = svc }
+
+// SetPageToolGate main.go 注入页面工具调用闸门（*opsctl.Opsctl）。
+func (e *Extension) SetPageToolGate(gate PageToolGate) { e.pageGate = gate }
 
 // Service 返回当前持有的 extension_svc.Service（main.go 需要它去做附加配置）。
 func (e *Extension) Service() *extension_svc.Service { return e.service }
@@ -47,7 +71,7 @@ func (e *Extension) NewHostProvider(extName string) interface{} {
 	return nil
 }
 
-// AssetConfigGetter / FileDialogOpener / KVStore / ActionEventHandler / TunnelDialer 暴露给 main.go
+// AssetConfigGetter / FileDialogOpener / KVStore / ActionEventHandler / AssetDialer 暴露给 main.go
 // 作为 extension.NewDefaultHostProvider 的依赖。
 
 // NewAssetConfigGetter 为指定扩展返回 assetConfigGetter：只服务该扩展自己注册的资产类型。
@@ -66,8 +90,10 @@ func (e *Extension) NewActionEventHandler(extName string) *actionEventHandler {
 	return &actionEventHandler{ctx: e.ctx, extName: extName}
 }
 
-// NewTunnelDialer 返回 tunnelDialer 实例。
-func (e *Extension) NewTunnelDialer() *tunnelDialer { return &tunnelDialer{pool: e.pool} }
+// NewAssetDialer 为指定扩展返回 assetDialer：解析该扩展资产声明的连接路径（SSH 隧道）。
+func (e *Extension) NewAssetDialer(extName string) *assetDialer {
+	return &assetDialer{ext: e, extName: extName}
+}
 
 // Startup 异步初始化扩展系统（WASM 编译较慢，单独协程跑）。
 func (e *Extension) Startup(ctx context.Context) {
