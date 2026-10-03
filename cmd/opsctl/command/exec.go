@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/opskat/opskat/internal/ai/aictx"
 	"github.com/opskat/opskat/internal/ai/audit"
@@ -14,6 +15,8 @@ import (
 	"github.com/opskat/opskat/internal/ai/permission"
 	"github.com/opskat/opskat/internal/ai/tool"
 	"github.com/opskat/opskat/internal/approval"
+	"github.com/opskat/opskat/internal/assettype"
+	"github.com/opskat/opskat/internal/extreg"
 	"github.com/opskat/opskat/internal/model/entity/asset_entity"
 
 	"golang.org/x/crypto/ssh"
@@ -24,6 +27,9 @@ const auditOutputLimit = 32768 // 审计日志捕获输出大小限制
 // execApprovalFn 是 exec 的审批入口。变量化是为了可测——与 cp.go 的 cpApprovalFn/
 // cpBatchApprovalFn 同一套路：测试替换掉它，避免真的去连桌面端审批 socket。
 var execApprovalFn = requireApproval
+
+// execStdin is where `--<flag>-file -` reads from; a variable so tests can feed it.
+var execStdin io.Reader = os.Stdin
 
 // execSSHStreamFn 是 exec 对 ssh 资产的流式执行入口，同上一套路。测试只需要断言
 // "ssh 资产走了这条路径"，不需要真的起一个 SSH 会话。
@@ -55,10 +61,18 @@ func cmdExec(ctx context.Context, handlers map[string]tool.ToolHandlerFunc, args
 		return 1
 	}
 
+	// 归属直接问资产类型注册表（启动时由 registerExtensionAssetTypes 按缓存的 describe()
+	// 接线）：内置类型天然报 ("", false)，因为注册表拒绝让扩展占用一个内置类型名——
+	// 与桌面端的冲突规则同一条，opsctl 不会因为磁盘上躺着这样一个 manifest 就改道。
+	// 提前拿到这个答案，同时喂给 parseExecArgs（多词 argv 的引号策略——扩展的 flag
+	// DSL 没有远端 shell，元字符必须逐词保真；ssh 等类型的多词语义不变）和下面的派发
+	// 判断，避免同一个"是不是扩展资产"的问题被问两次、答案还可能不一致。
+	extName, isExtensionAsset := assettype.ExtensionOwnerOf(asset.Type)
+
 	// --type 是可选断言：不参与派发（协议永远来自 asset.Type），只把方言写错的情况
 	// 提前变成一条点名双方类型的错误。必须在 requireApproval 之前——它会去问桌面端，
 	// 用户不该为一条注定失败的命令点头。
-	declaredType, scope, command, err := parseExecArgs(args[1:])
+	declaredType, scope, command, err := parseExecArgs(args[1:], isExtensionAsset)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n\n", err)
 		printExecUsage()
@@ -74,6 +88,13 @@ func cmdExec(ctx context.Context, handlers map[string]tool.ToolHandlerFunc, args
 	if err := validateRedisScope(asset, scope); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		return 1
+	}
+
+	// 扩展提供的资产类型：命令交回桌面进程执行。理由是执行位置而不是语义——WASM 运行时、
+	// 扩展的宿主能力与解密后的资产配置只存在于桌面进程里。桌面端跑的是同一个统一 exec
+	// handler，策略/审批/grant/审计因此与内置类型逐字一致，也由那一端落库。
+	if isExtensionAsset {
+		return execViaDesktop(asset, extName, command, session)
 	}
 
 	// Executor lookup / canonicalize / precheck — all side-effect-free, all must run
@@ -225,11 +246,33 @@ Arguments:
   asset       Asset name or numeric ID
   command     Command to execute on the remote asset.
               Use '--' to separate the command from opsctl flags.
-              Everything after '--' is joined into a single command string.
+              Everything after '--' becomes one command string, in one of two
+              ways. A single word is that string verbatim, so quoting the whole
+              command passes shell syntax through untouched:
+                opsctl exec web-01 -- 'tail -n50 /var/log/app.log | grep ERR'
+              Two or more words are joined back into one string, and how much
+              of each word's original shape survives that join depends on the
+              asset's real type. For ssh and the other built-in types, only a
+              word containing whitespace is re-quoted, so the boundary your
+              own shell consumed survives the re-split downstream and
+              everything else — globs, pipes, redirection — reaches the
+              remote shell as it always has:
+                opsctl exec web-01 -- grep "foo bar" *.log  →  grep 'foo bar' *.log
+              For an extension asset every word is re-quoted whenever needed,
+              because the extension flag DSL has no remote shell: a value
+              like --path='/x?a=1&b=2' must reach it as that exact literal,
+              not as shell operators:
+                opsctl exec my-store -- request --path='/x?a=1&b=2'
               Dispatched by the asset's real type: ssh keeps its streaming
-              channel (pipes, exit code); the other types (database, redis,
-              mongodb, etcd, kafka, k8s, oss) run through the unified exec
-              handler.
+              channel (pipes, exit code); the other built-in types (database,
+              redis, mongodb, etcd, kafka, k8s, oss) run through the unified
+              exec handler; an extension-provided type is executed by the
+              running desktop app, which owns the WASM runtime.
+              For an extension asset the command is "<tool> --flag=value" or
+              "<tool> --flag value" (space form; a boolean flag never
+              consumes the following word as its value — pass --flag=false
+              explicitly to set it to false); run 'opsctl help <asset>' for
+              its tool and flag reference.
 
 Flags:
   --type <type>   Optional assertion: fails fast if the asset is not of this
@@ -276,9 +319,40 @@ Examples:
   opsctl exec 1 --type ssh -- ls -la /var/log
   opsctl exec production/web-01 --type ssh -- cat /etc/hosts
   echo "hello" | opsctl exec web-server --type ssh -- cat
+  opsctl exec web-server --type ssh -- grep "connection refused" /var/log/app.log
+  opsctl exec web-server --type ssh -- 'ls /var/log/*.log | wc -l'
   opsctl exec prod-db --type database -- "SELECT * FROM users LIMIT 10"
   opsctl exec cache --type redis -- "GET session:abc123"
   opsctl exec cache --type redis --scope 1 -- "GET session:abc123"
   opsctl exec cache-cluster --type redis --scope 10.0.0.1:6379 -- DBSIZE
+  opsctl exec my-bucket -- list_objects --bucket=logs --maxKeys=100
 `)
+}
+
+// execViaDesktop 把一条扩展资产上的命令交给运行中的桌面端执行。
+//
+// 桌面端不在时 fail closed：本进程既没有 WASM 运行时，也没有扩展的策略引擎，
+// 在这里"本地跑一下"等于同时绕开两者。
+func execViaDesktop(asset *asset_entity.Asset, extName, command, session string) int {
+	// `--<flag>-file` is opsctl-only: read here, so the desktop (and its approval,
+	// grants and audit) only ever sees the inline `--<flag> <content>` form.
+	command, err := extreg.ExpandFileFlags(extName, command, execStdin)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	result, err := delegateExtExecFn(asset.ID, asset.Name, command, session)
+	if err != nil {
+		if strings.Contains(err.Error(), "cannot connect") {
+			fmt.Fprintf(os.Stderr,
+				"Error: asset %q is type=%s, provided by extension %q; the desktop app must be running to execute it\n",
+				asset.Name, asset.Type, extName)
+			return 1
+		}
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	// 结果原样输出，供管道与脚本消费。
+	fmt.Print(result)
+	return 0
 }

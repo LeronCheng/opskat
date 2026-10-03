@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/opskat/opskat/internal/ai/cmdline"
 	"github.com/opskat/opskat/internal/ai/permission"
 	"github.com/opskat/opskat/internal/model/entity/asset_entity"
 )
@@ -20,12 +21,16 @@ import (
 // 描述）：单机/哨兵资产是库号（缺省用资产配置的库），集群资产是无 key 命令必须指定的
 // 节点 host:port。仅对 redis 资产有意义——cmdExec 在解析后用 validateRedisScope 对非
 // redis 资产报错，而不是这里静默忽略或直接执行。
-func parseExecArgs(args []string) (declaredType, scope, command string, err error) {
+//
+// literalWords 选择多词 argv 重新拼接时的引号策略，见 joinCommandWords；调用方
+// （cmdExec）在解析参数前已经从资产类型拿到了这个答案（assettype.ExtensionOwnerOf），
+// 这里只是把那个已知的答案传下去，不重新判断资产类型。
+func parseExecArgs(args []string, literalWords bool) (declaredType, scope, command string, err error) {
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		switch {
 		case arg == "--":
-			command = strings.Join(args[i+1:], " ")
+			command = joinCommandWords(args[i+1:], literalWords)
 		case arg == "--type":
 			if i+1 >= len(args) {
 				return "", "", "", fmt.Errorf("--type requires a value")
@@ -49,7 +54,7 @@ func parseExecArgs(args []string) (declaredType, scope, command string, err erro
 		case strings.HasPrefix(arg, "-"):
 			return "", "", "", fmt.Errorf("unknown flag %s (put the remote command after --)", arg)
 		default:
-			command = strings.Join(args[i:], " ")
+			command = joinCommandWords(args[i:], literalWords)
 		}
 		break
 	}
@@ -70,6 +75,48 @@ func validateRedisScope(asset *asset_entity.Asset, scope string) error {
 		return nil
 	}
 	return fmt.Errorf("--scope is only meaningful for redis assets; asset %q is type=%s", asset.Name, asset.Type)
+}
+
+// joinCommandWords rebuilds the one command string from argv the local shell has
+// already split.
+//
+// A single word *is* that command string and is passed through untouched — it is the
+// documented form for every DSL opsctl forwards to (`-- "SELECT * FROM users"`), and
+// quoting it would hand the database a literal `'SELECT * FROM users'`. This holds
+// regardless of literalWords: a single argv word never gets re-quoted.
+//
+// Two or more words are argv, and every consumer re-splits the result with a real
+// shell parser (cmdline.Words underneath both the extension flag DSL and the
+// k8s/etcd/kafka canonicalizers, a remote shell for ssh) — so how much of each word's
+// original shape must survive that re-split depends on what the re-split feeds into:
+//
+//   - literalWords == false (every non-extension type, ssh included): the re-split
+//     result is handed to something that itself behaves like a shell (ssh(1), or a
+//     canonicalizer speaking a Unix-y command grammar), so a bare metacharacter like
+//     `*` or `&` is meant to keep meaning what it means to a shell. Only words
+//     containing whitespace carry a boundary the join would otherwise destroy; the
+//     rest are emitted bare, so `-- ls *.log` still reaches the remote shell as a
+//     glob, as ssh(1) does.
+//   - literalWords == true (an extension asset): the re-split result is the
+//     extension's flag DSL (internal/extreg/command.go), which has no shell and no
+//     use for shell operators — a value like `--path=/x?a=1&b=2` (one argv word this
+//     process already received intact) must come back out of the re-split as that
+//     exact word, `&` included, not as a background operator splitting the command in
+//     two. Every word is therefore quoted whenever it needs to be (cmdline.QuoteIfNeeded
+//     leaves an already-safe word bare), independent of whitespace.
+func joinCommandWords(words []string, literalWords bool) string {
+	if len(words) == 1 {
+		return words[0]
+	}
+	joined := make([]string, len(words))
+	for i, word := range words {
+		if literalWords || strings.ContainsAny(word, " \t\n") {
+			joined[i] = cmdline.QuoteIfNeeded(word)
+			continue
+		}
+		joined[i] = word
+	}
+	return strings.Join(joined, " ")
 }
 
 // parseRemotePath parses numeric assetID:path strings without repository lookup.
