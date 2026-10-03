@@ -1,8 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, act, fireEvent } from "@testing-library/react";
+import { render, screen, act, fireEvent, waitFor } from "@testing-library/react";
 import { OpsctlApprovalDialog } from "../components/approval/OpsctlApprovalDialog";
 import { EventsOn } from "../../wailsjs/runtime/runtime";
 import { RespondOpsctlApproval } from "../../wailsjs/go/opsctl/Opsctl";
+import { ExplainCommand } from "../../wailsjs/go/ai/AI";
 
 // opsctl:approval 事件处理器按事件名捕获，测试里直接调用模拟后端 EventsEmit。
 function captureHandlers() {
@@ -12,6 +13,12 @@ function captureHandlers() {
     return vi.fn();
   }) as never);
   return handlers;
+}
+
+function streamExplanation(handlers: Map<string, (data: unknown) => void>, answer: string) {
+  const requestID = vi.mocked(ExplainCommand).mock.calls.at(-1)![0];
+  const receive = handlers.get(`ai:command-explanation:${requestID}`)!;
+  act(() => receive({ sequence: 1, content: answer, done: true }));
 }
 
 function fireSingleApproval(handlers: Map<string, (data: unknown) => void>, overrides: Record<string, unknown> = {}) {
@@ -68,6 +75,38 @@ function batchItems(n: number, detail?: string) {
 describe("OpsctlApprovalDialog", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  it("keeps the dialog and approval pending while displaying the explanation inline", async () => {
+    vi.mocked(ExplainCommand).mockResolvedValue();
+    const handlers = captureHandlers();
+    render(<OpsctlApprovalDialog />);
+    fireSingleApproval(handlers);
+    fireEvent.click(screen.getByTestId("explain-command"));
+    streamExplanation(handlers, "显示目录内容。\n\n总结：读取目录列表。");
+    await waitFor(() => expect(screen.getByTestId("command-explanation-answer")).toHaveTextContent("显示目录内容"));
+    expect(ExplainCommand).toHaveBeenCalledWith(expect.any(String), {
+      type: "exec",
+      command: "ls -la",
+      asset_name: "web-1",
+      detail: "",
+    });
+    expect(screen.getByTestId("opsctl-approval-dialog")).toBeInTheDocument();
+    expect(RespondOpsctlApproval).not.toHaveBeenCalled();
+  });
+
+  it("does not carry an explanation into the next queued approval", async () => {
+    vi.mocked(ExplainCommand).mockResolvedValue();
+    const handlers = captureHandlers();
+    render(<OpsctlApprovalDialog />);
+    fireSingleApproval(handlers);
+    fireSingleApproval(handlers, { confirm_id: "opsctl_2", command: "pwd" });
+    fireEvent.click(screen.getByTestId("explain-command"));
+    streamExplanation(handlers, "First answer");
+    await screen.findByText("First answer");
+    fireEvent.click(screen.getByText("opsctlApproval.deny"));
+    expect(screen.getByText("pwd")).toBeInTheDocument();
+    expect(screen.queryByText("First answer")).not.toBeInTheDocument();
   });
 
   it("删除审批（后端 type=delete）不提供「记住」入口——删除不可 grant", () => {

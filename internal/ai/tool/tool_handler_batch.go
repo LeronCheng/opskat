@@ -228,6 +228,7 @@ func handleBatchCommand(ctx context.Context, args map[string]any) (string, error
 			resp := checker.ConfirmFunc()(ctx, permission.ApprovalKindBatch, needConfirmItems)
 			parsed, parseErr := permission.ParseApprovalResponse(permission.ApprovalKindBatch, resp, needConfirmItems)
 			for _, idx := range needConfirmIndices {
+				classification := resolved[idx].checkResult.Classification
 				switch {
 				case parseErr != nil:
 					resolved[idx].decision = "deny"
@@ -256,6 +257,7 @@ func handleBatchCommand(ctx context.Context, args map[string]any) (string, error
 						Message: resolved[idx].denyMsg,
 					}
 				}
+				resolved[idx].checkResult.Classification = classification
 			}
 		}
 	}
@@ -268,9 +270,11 @@ func handleBatchCommand(ctx context.Context, args map[string]any) (string, error
 		}
 		resolved[i].decision = "deny"
 		resolved[i].denyMsg = "command requires confirmation but no approval mechanism is configured"
+		classification := resolved[i].checkResult.Classification
 		resolved[i].checkResult = aictx.CheckResult{
 			Decision: aictx.Deny, DecisionSource: aictx.SourcePolicyDeny,
-			Message: resolved[i].denyMsg,
+			Message:        resolved[i].denyMsg,
+			Classification: classification,
 		}
 	}
 

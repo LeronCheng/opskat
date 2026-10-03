@@ -2,6 +2,7 @@ package audit
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	"github.com/opskat/opskat/internal/ai/aictx"
 	"github.com/opskat/opskat/internal/model/entity/asset_entity"
 	"github.com/opskat/opskat/internal/model/entity/audit_entity"
+	"github.com/opskat/opskat/internal/pkg/jev"
 	"github.com/opskat/opskat/internal/repository/asset_repo"
 	"github.com/opskat/opskat/internal/repository/audit_repo"
 	"github.com/opskat/opskat/migrations"
@@ -160,4 +162,15 @@ func TestDefaultAuditWriterPersistsToolAuditSemantics(t *testing.T) {
 	require.Contains(t, sensitive.Request, "<redacted>")
 	require.Contains(t, sensitive.Result, "stored-result-secret")
 	require.Contains(t, sensitive.Error, "stored-error-secret")
+	classification := &jev.Classification{Level1: "SENSITIVE_READ", Level2: []string{"CREDENTIAL_READ"}, Status: "OK", Model: jev.Model, PolicyVersion: jev.PolicyVersion}
+	NewDefaultAuditWriter().WriteToolCall(aictx.WithSessionID(context.Background(), "jev-evidence"), ToolCallInfo{
+		ToolName: "exec", AssetID: asset.ID, Command: "cat /etc/shadow", ArgsJSON: `{"command":"cat /etc/shadow"}`,
+		Decision: &aictx.CheckResult{Decision: aictx.Allow, DecisionSource: aictx.SourceUserAllow, Classification: classification},
+	})
+	var classified audit_entity.AuditLog
+	require.NoError(t, gdb.Where("session_id = ?", "jev-evidence").First(&classified).Error)
+	require.Equal(t, "SENSITIVE_READ", classified.CommandType)
+	var stored jev.Classification
+	require.NoError(t, json.Unmarshal([]byte(classified.Classification), &stored))
+	require.Equal(t, classification, &stored)
 }

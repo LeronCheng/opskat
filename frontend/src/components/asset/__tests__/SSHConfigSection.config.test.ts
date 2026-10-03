@@ -17,6 +17,19 @@ const NO_SECRETS: SSHBuildOptions = {
 
 const base = (over: Partial<SSHFormState>): SSHFormState => ({ ...SSH_DEFAULTS, host: "1.2.3.4", ...over });
 
+describe("Agent operation policy persistence", () => {
+  it("defaults existing assets to approval and preserves a selected policy through save and edit", () => {
+    expect(parseSSHConfig('{"host":"server"}').agentOperationPolicy).toBe("approval");
+    for (const agentOperationPolicy of ["safe_read", "read_only", "safe_write", "trust"] as const) {
+      const serialized = buildSSHConfig(base({ agentOperationPolicy }), NO_SECRETS);
+      expect(JSON.parse(serialized).agent_operation_policy).toBe(agentOperationPolicy);
+      expect(parseSSHConfig(serialized).agentOperationPolicy).toBe(agentOperationPolicy);
+    }
+    const serialized = buildSSHConfig(base({ agentOperationPolicy: "approval" }), NO_SECRETS);
+    expect(parseSSHConfig(serialized).agentOperationPolicy).toBe("approval");
+  });
+});
+
 describe("buildSSHConfig (锁旧 save/test 序:host→port→username→auth_type→凭据/密钥→jump_host_id→proxy)", () => {
   describe("password-auth", () => {
     it("managed → credential_id 紧跟 auth_type", () => {

@@ -15,6 +15,7 @@ type AppConfig struct {
 	AIProviderType                  string `json:"ai_provider_type,omitempty"`                  // openai, local_cli
 	AIAPIBase                       string `json:"ai_api_base,omitempty"`                       // API base URL 或 CLI 路径
 	AIAPIKey                        string `json:"ai_api_key,omitempty"`                        // 加密后的 API Key
+	JevAPIKey                       string `json:"jev_api_key,omitempty"`                       // 加密后的 Jev API Key
 	AIModel                         string `json:"ai_model,omitempty"`                          // 模型名或 CLI 类型
 	GitHubToken                     string `json:"github_token,omitempty"`                      // 加密后的 GitHub token
 	GitHubUser                      string `json:"github_user,omitempty"`                       // GitHub 用户名（非敏感）

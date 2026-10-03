@@ -20,6 +20,7 @@ import { RespondAIApproval } from "../../../wailsjs/go/ai/AI";
 import { permission } from "../../../wailsjs/go/models";
 import type { ContentBlock } from "@/stores/aiStore";
 import { hasApprovalCommandEdits } from "@/lib/approval";
+import { CommandExplanation } from "./CommandExplanation";
 
 interface ApprovalBlockProps {
   block: ContentBlock;
@@ -77,6 +78,7 @@ export const ApprovalBlock = memo(function ApprovalBlock({ block }: ApprovalBloc
           {item.command}
         </code>
       </div>
+      <CommandExplanation key={`${block.confirmId}:${i}`} item={item} />
     </div>
   );
 
@@ -185,6 +187,7 @@ export const ApprovalBlock = memo(function ApprovalBlock({ block }: ApprovalBloc
                     </code>
                   </div>
                 )}
+                {kind !== "grant" && <CommandExplanation key={`${block.confirmId}:${i}`} item={item} />}
                 {item.detail &&
                   (kind === "delete" ? (
                     // 删除不可逆：警告不能藏在一次点击之后，常驻展示而不是 <details> 折叠。
@@ -243,7 +246,7 @@ export const ApprovalBlock = memo(function ApprovalBlock({ block }: ApprovalBloc
       )}
 
       {/* Action buttons */}
-      <div className="flex justify-end gap-2 pt-1">
+      <div className="flex flex-wrap justify-end gap-2 pt-1">
         {kind === "batch" ? (
           <>
             <Button

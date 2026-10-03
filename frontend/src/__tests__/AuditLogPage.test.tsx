@@ -85,4 +85,54 @@ describe("AuditLogPage result status", () => {
     expect(screen.getByText('{"response":"selectable"}')).toHaveClass("select-text");
     expect(screen.getByText("selectable-error")).toHaveClass("select-text");
   });
+
+  it("shows primary and secondary probabilities as percentage bars instead of JSON", async () => {
+    const classification = JSON.stringify({
+      level1: "DANGEROUS_CHANGE",
+      level2: ["CONFIG_CHANGE"],
+      status: "OK",
+      primary: {
+        probabilities: {
+          SAFE_READ: 0.01,
+          SENSITIVE_READ: 0.02,
+          SAFE_CHANGE: 0.03,
+          DANGEROUS_CHANGE: 0.9,
+          UNKNOWN: 0.04,
+        },
+      },
+      secondary: { CONFIG_CHANGE: { noul: 0.91 }, SERVICE_HOST_CHANGE: { noul: 0.72 } },
+    });
+    vi.mocked(ListAuditLogs).mockResolvedValue({
+      items: [
+        {
+          ID: 3,
+          ToolName: "exec",
+          Command: "systemctl restart nginx",
+          CommandType: "DANGEROUS_CHANGE",
+          Classification: classification,
+          Createtime: 1,
+        },
+      ],
+      total: 1,
+    } as never);
+    const user = userEvent.setup();
+    render(<AuditLogPage />);
+    const row = (await screen.findByText("exec")).closest("tr")!;
+    await user.click(within(row).getByRole("button"));
+    const details = within(screen.getByRole("dialog"));
+    expect(details.getByRole("progressbar", { name: "commandType.DANGEROUS_CHANGE" })).toHaveAttribute(
+      "aria-valuenow",
+      "90"
+    );
+    expect(details.getByRole("progressbar", { name: "commandSubtype.CONFIG_CHANGE" })).toHaveAttribute(
+      "aria-valuenow",
+      "91"
+    );
+    expect(details.getByRole("progressbar", { name: "commandSubtype.SERVICE_HOST_CHANGE" })).toHaveAttribute(
+      "aria-valuenow",
+      "72"
+    );
+    expect(details.getAllByRole("progressbar")).toHaveLength(7);
+    expect(details.queryByText(classification)).not.toBeInTheDocument();
+  });
 });

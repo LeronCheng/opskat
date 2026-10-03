@@ -75,7 +75,7 @@ func SupportsGrantApproval(approvalType string) bool {
 }
 
 func init() {
-	registerPermissionType(asset_entity.AssetTypeSSH, "exec", shellGrantPatterns, checkCommandPolicyPermission, "exec")
+	registerPermissionType(asset_entity.AssetTypeSSH, "exec", shellGrantPatterns, checkSSHAgentPermission, "exec")
 	registerPermissionType(asset_entity.AssetTypeSerial, "serial", nil, checkCommandPolicyPermission)
 	registerPermissionType(asset_entity.AssetTypeDatabase, "sql", nil, checkDatabasePermission, "sql", "db")
 	registerPermissionType(asset_entity.AssetTypeRedis, "redis", nil, checkRedisPermission)

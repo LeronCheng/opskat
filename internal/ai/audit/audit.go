@@ -180,6 +180,15 @@ func (w *DefaultAuditWriter) WriteToolCall(ctx context.Context, info ToolCallInf
 		// 内容识别或值替换——决策来源与 allow/deny 分类保持 correlation。
 		entry.MatchedPattern = info.Decision.MatchedPattern
 	}
+	if info.Decision != nil && info.Decision.Classification != nil {
+		entry.CommandType = info.Decision.Classification.Level1
+		data, err := json.Marshal(info.Decision.Classification)
+		if err != nil {
+			logger.Ctx(ctx).Error("marshal command classification failed", zap.String("toolName", info.ToolName), zap.Error(err))
+		} else {
+			entry.Classification = string(data)
+		}
+	}
 
 	if repo := audit_repo.Audit(); repo != nil {
 		if err := repo.Create(context.Background(), entry); err != nil {

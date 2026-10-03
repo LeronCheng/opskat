@@ -23,6 +23,9 @@ export default defineConfig({
   },
   // dev: 预热首屏关键路径，避免 Vite 按需 transform 在窗口出现后串行排队
   server: {
+    // Wails 的开发资源代理连接 127.0.0.1；显式绑定 IPv4，避免 macOS
+    // 将 localhost 解析为 ::1 后导致代理连接被拒绝、桌面窗口白屏。
+    host: "127.0.0.1",
     warmup: {
       clientFiles: [
         "./src/main.tsx",

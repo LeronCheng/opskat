@@ -17,6 +17,7 @@ import { RespondOpsctlApproval } from "../../../wailsjs/go/opsctl/Opsctl";
 import { permission } from "../../../wailsjs/go/models";
 import { ShieldAlert, Terminal, Database, Server, FolderOpen, Globe, Usb, Trash2, Boxes, FileUp } from "lucide-react";
 import { hasApprovalCommandEdits } from "@/lib/approval";
+import { CommandExplanation } from "./CommandExplanation";
 
 interface ApprovalItemData {
   type: string;
@@ -269,6 +270,7 @@ export function OpsctlApprovalDialog({ suspended = false }: { suspended?: boolea
         </div>
       )}
       {item.detail && <div className="select-text text-xs text-muted-foreground font-mono">{item.detail}</div>}
+      {cur.kind !== "grant" && <CommandExplanation key={`${cur.id}:${i}`} item={item} />}
     </div>
   );
 

@@ -135,10 +135,12 @@ func TestCmdListAudit(t *testing.T) {
 			_, out := runListAudit(aictx.WithPolicyLang(context.Background(), "en"), "audit")
 			So(out, ShouldContainSubstring, "TIME")
 			So(out, ShouldContainSubstring, "DECISION SOURCE")
+			So(out, ShouldContainSubstring, "COMMAND TYPE")
 
 			_, out = runListAudit(aictx.WithPolicyLang(context.Background(), "zh-cn"), "audit")
 			So(out, ShouldContainSubstring, "时间")
 			So(out, ShouldContainSubstring, "决策来源")
+			So(out, ShouldContainSubstring, "命令类型")
 		})
 
 		Convey("long commands are summarized, stored values are presented verbatim", func() {
@@ -146,7 +148,8 @@ func TestCmdListAudit(t *testing.T) {
 				{
 					ID: 1, Source: "opsctl", ToolName: "exec", AssetID: 7, AssetName: "web-01",
 					Command: strings.Repeat("x", 100), Decision: "allow", DecisionSource: "user_allow",
-					Createtime: 1755400000,
+					CommandType: "SAFE_READ",
+					Createtime:  1755400000,
 				},
 				{
 					ID: 2, Source: "ai", ToolName: "list_assets",
@@ -162,6 +165,7 @@ func TestCmdListAudit(t *testing.T) {
 			So(out, ShouldNotContainSubstring, strings.Repeat("x", 70))
 			// 原样：存量字段不二次改写、不脱敏、不补占位
 			So(out, ShouldContainSubstring, "user_allow")
+			So(out, ShouldContainSubstring, "SAFE_READ")
 			So(out, ShouldContainSubstring, "web-01")
 			So(out, ShouldContainSubstring, "list_assets")
 			So(out, ShouldNotContainSubstring, "***")

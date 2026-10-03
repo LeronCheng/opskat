@@ -834,7 +834,8 @@
     "sshStartupCommandHint": "Runs on every connect and reconnect, and in every split pane. With “Restore last directory on reconnect” enabled it runs after the directory is restored.",
     "tabSchemaRegistry": "Schema Registry",
     "tabConnect": "Connect",
-    "addDescription": "Add description"
+    "addDescription": "Add description",
+    "agentOperationPolicy": "Agent operation policy"
   },
   "sshKey": {
     "title": "SSH Keys",
@@ -1326,7 +1327,8 @@
       "sync": "Link to this tab",
       "syncing": "Linked",
       "referencedThisSession": "Referenced"
-    }
+    },
+    "explainCommand": "Explain command"
   },
   "shortcut": {
     "title": "Shortcuts",
@@ -1878,7 +1880,19 @@
     "sessionGroupThisWeek": "This week",
     "sessionGroupEarlier": "Earlier",
     "sessionOps": "{{count}} ops",
-    "sessionPatterns": "Session approved patterns"
+    "sessionPatterns": "Session approved patterns",
+    "commandType": "Command type",
+    "classification": "Jev classification details",
+    "primaryClassification": "Primary classification",
+    "secondaryClassification": "Secondary classification",
+    "classificationNoProbabilities": "No classification probabilities were produced.",
+    "classificationInvalid": "Jev classification data is incomplete or invalid; probabilities cannot be displayed.",
+    "classificationStatus": {
+      "REVIEW": "Review required",
+      "ERROR": "Classification failed",
+      "UNCONFIGURED": "Jev is not configured",
+      "BLOCKED": "Blocked by blacklist"
+    }
   },
   "zmodem": {
     "downloadComplete": "Received {{name}}",
@@ -3176,5 +3190,43 @@
       "error": "Error",
       "closed": "Closed"
     }
+  },
+  "agentPolicy": {
+    "approval": "Approval",
+    "safe_read": "Safe read",
+    "read_only": "Read only",
+    "safe_write": "Safe write",
+    "trust": "Trust",
+    "approvalHint": "Approve each command without an existing authorization. Blacklists always apply.",
+    "safe_readHint": "Run safe reads automatically. Approve other types and uncertain results.",
+    "read_onlyHint": "Run safe and sensitive reads automatically. Approve changes and uncertain results.",
+    "safe_writeHint": "Run safe reads, sensitive reads and safe changes automatically. Approve dangerous changes and uncertain results.",
+    "trustHint": "Run all commands outside the blacklist, including unclassified commands. Shell syntax that prevents reliable blacklist checks still requires approval."
+  },
+  "commandType": {
+    "SAFE_READ": "Safe read",
+    "SENSITIVE_READ": "Sensitive read",
+    "SAFE_CHANGE": "Safe change",
+    "DANGEROUS_CHANGE": "Dangerous change",
+    "UNKNOWN": "Unknown"
+  },
+  "jev": {
+    "title": "Jev command classification",
+    "description": "Jev classifies server exec commands so the asset’s Agent operation policy can allow automatic execution.",
+    "hint": "The API key is encrypted at rest. When configured, server commands and necessary target context are sent to TypeSafe, without asset passwords or private keys. Failed or uncertain judgments require approval except on trusted assets. Clear and save to remove the key."
+  },
+  "commandSubtype": {
+    "CREDENTIAL_READ": "Credentials and keys",
+    "BUSINESS_PERSONAL_READ": "Business and personal data",
+    "INTERNAL_SECURITY_READ": "Internal configuration and security information",
+    "RESOURCE_LOCK_READ": "Resource load and lock sensitive reads",
+    "CONFIG_CHANGE": "Configuration changes",
+    "SERVICE_HOST_CHANGE": "Service and host state changes",
+    "DELETE_DESTROY": "Deletion or destruction",
+    "ACCESS_SECURITY_CHANGE": "Access and security policy changes",
+    "SOFTWARE_RUNTIME_CHANGE": "Software and runtime changes",
+    "BUSINESS_DATA_CHANGE": "Business data changes",
+    "PERSISTENCE_CHANGE": "Scheduled tasks and persistence",
+    "SENSITIVE_DATA_EXPOSURE": "Sensitive data exposure or transfer"
   }
 }

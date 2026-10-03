@@ -274,7 +274,7 @@ func cmdBatch(ctx context.Context, handlers map[string]tool.ToolHandlerFunc, arg
 				cmd := resolved[b.idx]
 				results[b.idx].Error = fmt.Sprintf("approval failed: %v", approvalErr)
 				argsJSON := batchArgsJSON(cmd.asset.ID, cmd.command, cmd.scope)
-				decision := &aictx.CheckResult{Decision: aictx.Deny, DecisionSource: approvalResult.DecisionSource}
+				decision := &aictx.CheckResult{Decision: aictx.Deny, DecisionSource: approvalResult.DecisionSource, Classification: cmd.decision.Classification}
 				deniedCtx := withBatchAuditCommand(auditCtx, cmd.checkCommand)
 				writeOpsctlAudit(deniedCtx, batchAuditTool, argsJSON, "", approvalErr, decision)
 			}
@@ -283,9 +283,11 @@ func cmdBatch(ctx context.Context, handlers map[string]tool.ToolHandlerFunc, arg
 			auditCtx = aictx.WithSessionID(auditCtx, session)
 			// Update decision to user_allow for approved commands
 			for _, b := range needConfirm {
+				classification := resolved[b.idx].decision.Classification
 				resolved[b.idx].decision = &aictx.CheckResult{
 					Decision:       aictx.Allow,
 					DecisionSource: aictx.SourceUserAllow,
+					Classification: classification,
 				}
 				execSet[b.idx] = true
 			}

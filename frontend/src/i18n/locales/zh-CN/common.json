@@ -834,7 +834,8 @@
     "sshStartupCommandHint": "每次连接（含重连）与每个分屏窗格都会执行；同时开启「重连恢复上次目录」时，在恢复目录之后执行。",
     "tabSchemaRegistry": "Schema Registry",
     "tabConnect": "Connect",
-    "addDescription": "添加备注"
+    "addDescription": "添加备注",
+    "agentOperationPolicy": "Agent 操作策略"
   },
   "sshKey": {
     "title": "SSH 密钥",
@@ -1326,7 +1327,8 @@
       "sync": "联动此 tab",
       "syncing": "联动中",
       "referencedThisSession": "本次引用"
-    }
+    },
+    "explainCommand": "解释命令"
   },
   "shortcut": {
     "title": "快捷键",
@@ -1878,7 +1880,19 @@
     "sessionGroupThisWeek": "本周",
     "sessionGroupEarlier": "更早",
     "sessionOps": "{{count}} 条操作",
-    "sessionPatterns": "会话已允许模式"
+    "sessionPatterns": "会话已允许模式",
+    "commandType": "命令类型",
+    "classification": "Jev 判断详情",
+    "primaryClassification": "一级分类",
+    "secondaryClassification": "二级分类",
+    "classificationNoProbabilities": "本次未生成分类概率。",
+    "classificationInvalid": "Jev 判断数据不完整或格式错误，无法展示概率。",
+    "classificationStatus": {
+      "REVIEW": "需要复核",
+      "ERROR": "判断失败",
+      "UNCONFIGURED": "Jev 未配置",
+      "BLOCKED": "已被黑名单拦截"
+    }
   },
   "zmodem": {
     "downloadComplete": "{{name}} 接收完成",
@@ -3176,5 +3190,43 @@
       "error": "错误",
       "closed": "已断开"
     }
+  },
+  "agentPolicy": {
+    "approval": "审批",
+    "safe_read": "安全读",
+    "read_only": "只读",
+    "safe_write": "安全写",
+    "trust": "信任",
+    "approvalHint": "未匹配已有授权的命令逐条审批。黑名单始终拦截。",
+    "safe_readHint": "安全读自动运行；其他类型或判断不确定时审批。",
+    "read_onlyHint": "安全读和敏感读自动运行；变更或判断不确定时审批。",
+    "safe_writeHint": "安全读、敏感读和安全变更自动运行；危险变更或判断不确定时审批。",
+    "trustHint": "所有非黑名单命令自动运行，包括无法分类的命令；无法可靠检查黑名单的 Shell 语法仍需审批。"
+  },
+  "commandType": {
+    "SAFE_READ": "安全读",
+    "SENSITIVE_READ": "敏感读",
+    "SAFE_CHANGE": "安全变更",
+    "DANGEROUS_CHANGE": "危险变更",
+    "UNKNOWN": "无法确定"
+  },
+  "jev": {
+    "title": "Jev 命令判断",
+    "description": "Jev 判断服务器 exec 命令的类型，按资产的 Agent 操作策略决定是否自动运行。",
+    "hint": "API Key 加密保存。已配置时，服务器命令及必要的目标信息会发送给 TypeSafe；不发送资产密码或私钥。判断失败或不确定时转人工审批（信任等级除外）。清空后保存可移除 Key。"
+  },
+  "commandSubtype": {
+    "CREDENTIAL_READ": "凭据与密钥读取",
+    "BUSINESS_PERSONAL_READ": "业务与个人数据读取",
+    "INTERNAL_SECURITY_READ": "内部配置与安全信息读取",
+    "RESOURCE_LOCK_READ": "高负载与锁敏感读取",
+    "CONFIG_CHANGE": "配置变更",
+    "SERVICE_HOST_CHANGE": "服务与主机状态变更",
+    "DELETE_DESTROY": "删除或破坏",
+    "ACCESS_SECURITY_CHANGE": "权限与安全策略变更",
+    "SOFTWARE_RUNTIME_CHANGE": "软件与运行环境变更",
+    "BUSINESS_DATA_CHANGE": "业务数据变更",
+    "PERSISTENCE_CHANGE": "计划任务与持久化变更",
+    "SENSITIVE_DATA_EXPOSURE": "敏感数据暴露与外传"
   }
 }

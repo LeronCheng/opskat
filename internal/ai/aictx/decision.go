@@ -1,5 +1,7 @@
 package aictx
 
+import "github.com/opskat/opskat/internal/pkg/jev"
+
 // Decision 权限判定结果
 type Decision int
 
@@ -17,6 +19,7 @@ const (
 	SourceUserDeny    = "user_deny"    // 用户手动拒绝
 	SourceGrantAllow  = "grant_allow"  // Grant 预批准匹配放行
 	SourceGrantDeny   = "grant_deny"   // Grant 权限申请被拒绝
+	SourceAgentPolicy = "agent_policy"
 )
 
 // 统一 exec 的短路来源：命令在触达权限检查之前就已经确定不会执行。
@@ -43,6 +46,7 @@ const (
 
 // CheckResult 权限检查结果
 type CheckResult struct {
+	Classification *jev.Classification
 	Decision       Decision
 	Message        string   // 返回给 AI 的消息
 	HintRules      []string // 拒绝时的允许规则提示

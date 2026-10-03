@@ -57,6 +57,7 @@ import { notifySuccess } from "@/lib/notify";
 import { BrowserOpenURL } from "../../../wailsjs/runtime/runtime";
 import { AIProviderForm, type AIProviderFormValues, type ReasoningEffort } from "@/components/ai/AIProviderForm";
 import { useAIStore } from "@/stores/aiStore";
+import { JevSettingsSection } from "./JevSettingsSection";
 
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
@@ -657,6 +658,8 @@ export function AISettingsSection() {
           </Button>
         </CardContent>
       </Card>
+
+      <JevSettingsSection />
 
       {/* Add/Edit Dialog */}
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>

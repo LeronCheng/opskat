@@ -40,6 +40,7 @@ import {
   parseSSHConfig,
   parseSSHPasswordCredentialConfig,
   SSH_DEFAULTS,
+  AGENT_OPERATION_POLICIES,
   type SSHFormState,
 } from "./SSHConfigSection.config";
 import { proxyChainValidationKey, resolveSaveProxyChainSecrets } from "./proxyConfig";
@@ -551,6 +552,19 @@ export function SSHConfigSection({ editAsset, onValidityChange, ref }: ConfigSec
       key: "advanced",
       label: "asset.tabAdvanced",
       fields: [
+        {
+          kind: "select",
+          key: "agentOperationPolicy",
+          label: "asset.agentOperationPolicy",
+          options: AGENT_OPERATION_POLICIES.map((value) => ({ value, label: `agentPolicy.${value}` })),
+          testid: "ssh-agent-operation-policy",
+        },
+        {
+          kind: "custom",
+          render: (s) => (
+            <p className="text-xs text-muted-foreground">{t(`agentPolicy.${s.agentOperationPolicy}Hint`)}</p>
+          ),
+        },
         {
           kind: "textarea",
           key: "startupCommand",

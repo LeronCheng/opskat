@@ -8,6 +8,7 @@ import { parseDetailConfig } from "./utils";
 import { GetAgentAssetDetail } from "../../../../wailsjs/go/system/System";
 import { system as system_models } from "../../../../wailsjs/go/models";
 import { agentStatusLabel } from "@/components/settings/agentSource";
+import { parseSSHConfig } from "../SSHConfigSection.config";
 
 interface SSHConfig {
   host: string;
@@ -78,6 +79,10 @@ export function SSHDetailInfoCard({ asset, sshTunnelName }: DetailInfoCardProps)
           <InfoItem label={t("asset.host")} value={cfg.host} mono />
           <InfoItem label={t("asset.port")} value={String(cfg.port)} mono />
           <InfoItem label={t("asset.username")} value={cfg.username} mono />
+          <InfoItem
+            label={t("asset.agentOperationPolicy")}
+            value={t(`agentPolicy.${parseSSHConfig(asset.Config).agentOperationPolicy}`)}
+          />
           <InfoItem
             label={t("asset.authType")}
             value={

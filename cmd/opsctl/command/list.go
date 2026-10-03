@@ -111,15 +111,16 @@ func cmdListAudit(ctx context.Context, asset string, limit int) int {
 	var sb strings.Builder
 	w := tabwriter.NewWriter(&sb, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, policy.PolicyMsg(ctx, //nolint:errcheck // 终端呈现尽力而为
-		"TIME\tSOURCE\tASSET\tTOOL\tCOMMAND\tDECISION SOURCE",
-		"时间\t来源\t资产\t工具\t命令摘要\t决策来源"))
+		"TIME\tSOURCE\tASSET\tTOOL\tCOMMAND\tCOMMAND TYPE\tDECISION SOURCE",
+		"时间\t来源\t资产\t工具\t命令摘要\t命令类型\t决策来源"))
 	for _, log := range logs {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", //nolint:errcheck // 终端呈现尽力而为
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", //nolint:errcheck // 终端呈现尽力而为
 			time.Unix(log.Createtime, 0).Format("2006-01-02 15:04:05"),
 			log.Source,
 			auditAssetCell(log),
 			log.ToolName,
 			nonEmpty(truncateStr(log.Command, auditCommandSummaryWidth)),
+			nonEmpty(log.CommandType),
 			nonEmpty(log.DecisionSource),
 		)
 	}

@@ -25,6 +25,7 @@ import { ListAuditLogs } from "../../../wailsjs/go/system/System";
 import { ListAuditSessions } from "../../../wailsjs/go/system/System";
 import { GetSSHPoolConnections } from "../../../wailsjs/go/ssh/SSH";
 import { audit_entity, audit_repo, sshpool } from "../../../wailsjs/go/models";
+import { JevClassificationDetails } from "./JevClassificationDetails";
 
 const PAGE_SIZE = 20;
 
@@ -52,6 +53,8 @@ function decisionSourceBadge(source: string): { label: string; className: string
       return { label: "grant", className: "bg-info/15 text-info" };
     case "grant_deny":
       return { label: "grant", className: "bg-destructive/15 text-destructive" };
+    case "agent_policy":
+      return { label: "agent", className: "bg-success/15 text-success" };
     default:
       return { label: source || "-", className: "bg-muted" };
   }
@@ -392,6 +395,7 @@ export function AuditLogPage() {
                   <th className="px-4 py-2 font-medium">{t("audit.toolName")}</th>
                   <th className="px-4 py-2 font-medium">{t("audit.assetName")}</th>
                   <th className="px-4 py-2 font-medium">{t("audit.command")}</th>
+                  <th className="px-4 py-2 font-medium">{t("audit.commandType")}</th>
                   <th className="px-4 py-2 font-medium">{t("audit.decision")}</th>
                   <th className="px-4 py-2 font-medium w-16 text-center">{t("audit.result")}</th>
                   <th className="px-4 py-2 font-medium w-16"></th>
@@ -400,7 +404,7 @@ export function AuditLogPage() {
               <tbody className="select-text">
                 {logs.length === 0 && !loading && (
                   <tr>
-                    <td colSpan={7} className="px-4 py-12 text-center text-muted-foreground">
+                    <td colSpan={8} className="px-4 py-12 text-center text-muted-foreground">
                       {t("audit.empty")}
                     </td>
                   </tr>
@@ -416,6 +420,9 @@ export function AuditLogPage() {
                       <td className="px-4 py-2">{log.AssetName || "-"}</td>
                       <td className="px-4 py-2 font-mono text-xs max-w-48 truncate" title={log.Command}>
                         {truncate(log.Command)}
+                      </td>
+                      <td className="px-4 py-2 text-xs whitespace-nowrap">
+                        {log.CommandType ? t(`commandType.${log.CommandType}`) : "-"}
                       </td>
                       <td className="px-4 py-2">
                         {log.DecisionSource ? (
@@ -555,6 +562,12 @@ export function AuditLogPage() {
                     <code className="font-mono bg-muted px-1 rounded">{detailLog.MatchedPattern}</code>
                   </div>
                 )}
+                {detailLog.CommandType && (
+                  <div>
+                    <span className="text-muted-foreground">{t("audit.commandType")}:</span>{" "}
+                    {t(`commandType.${detailLog.CommandType}`)}
+                  </div>
+                )}
                 {detailLog.SessionID && (
                   <div className="col-span-2">
                     <span className="text-muted-foreground">{t("audit.sessionID")}:</span>{" "}
@@ -575,6 +588,12 @@ export function AuditLogPage() {
                 </div>
               )}
 
+              {detailLog.Classification && (
+                <div>
+                  <div className="text-muted-foreground mb-1">{t("audit.classification")}</div>
+                  <JevClassificationDetails source={detailLog.Classification} />
+                </div>
+              )}
               {detailLog.Request && (
                 <div>
                   <div className="text-muted-foreground mb-1">{t("audit.request")}</div>

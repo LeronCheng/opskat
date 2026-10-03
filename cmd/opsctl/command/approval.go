@@ -12,6 +12,7 @@ import (
 	"github.com/opskat/opskat/internal/ai/policy"
 	"github.com/opskat/opskat/internal/approval"
 	"github.com/opskat/opskat/internal/bootstrap"
+	"github.com/opskat/opskat/internal/pkg/jev"
 
 	"github.com/cago-frame/cago/pkg/logger"
 	"github.com/google/uuid"
@@ -28,6 +29,7 @@ const (
 
 // ApprovalResult 审批结果，包含决策来源信息（用于审计）
 type ApprovalResult struct {
+	Classification *jev.Classification
 	Decision       aictx.Decision // Allow | Deny
 	DecisionSource string         // ai.Source* 常量
 	MatchedPattern string         // 匹配的规则或模式
@@ -37,6 +39,7 @@ type ApprovalResult struct {
 // ToCheckResult 转换为 CheckResult（供 AuditWriter 使用）
 func (ar ApprovalResult) ToCheckResult() *aictx.CheckResult {
 	return &aictx.CheckResult{
+		Classification: ar.Classification,
 		Decision:       ar.Decision,
 		DecisionSource: ar.DecisionSource,
 		MatchedPattern: ar.MatchedPattern,
@@ -84,7 +87,9 @@ func originCommandFromCtx(ctx context.Context) string {
 // requireApproval 检查命令策略 → DB Grant 匹配 → 选择审批人（spec Approver selection）：
 // 可交互（stdin 与 stderr 双 TTY）走终端提示、不联系桌面端；不可交互且 approval.sock
 // 可达走桌面弹窗（保持现状，含 stale socket 判定）；否则结构化拒绝（退出码 3 + 固定标记）。
-func requireApproval(ctx context.Context, req approval.ApprovalRequest) (ApprovalResult, error) {
+func requireApproval(ctx context.Context, req approval.ApprovalRequest) (result ApprovalResult, err error) {
+	var classification *jev.Classification
+	defer func() { result.Classification = classification }()
 	// Stage 1: Auto-create session if none exists
 	if req.SessionID == "" {
 		id := uuid.New().String()
@@ -105,6 +110,7 @@ func requireApproval(ctx context.Context, req approval.ApprovalRequest) (Approva
 			checkType = req.Type
 		}
 		permResult := permission.CheckPermission(permCtx, checkType, req.AssetID, req.Command)
+		classification = permResult.Classification
 
 		switch permResult.Decision {
 		case aictx.Allow:

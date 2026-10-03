@@ -48,6 +48,10 @@ func checkCommandPolicyPermission(ctx context.Context, assetID int64, command st
 	if err != nil {
 		logger.Default().Warn("get asset for permission check", zap.Int64("assetID", assetID), zap.Error(err))
 	}
+	return checkShellPolicy(ctx, asset, assetID, command)
+}
+
+func checkShellPolicy(ctx context.Context, asset *asset_entity.Asset, assetID int64, command string) aictx.CheckResult {
 	var groups []*group_entity.Group
 	if asset != nil && asset.GroupID > 0 {
 		groups = policy.ResolveGroupChain(ctx, asset.GroupID)

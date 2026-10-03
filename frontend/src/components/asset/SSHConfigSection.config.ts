@@ -1,4 +1,7 @@
 import type { CredentialFragment } from "./credentialConfig";
+
+export const AGENT_OPERATION_POLICIES = ["approval", "safe_read", "read_only", "safe_write", "trust"] as const;
+export type AgentOperationPolicy = (typeof AGENT_OPERATION_POLICIES)[number];
 import {
   CONNECTION_DEFAULTS,
   buildProxyChainJSON,
@@ -26,6 +29,7 @@ interface SSHConfig {
   keepalive_interval_seconds?: number;
   restore_cwd_on_reconnect?: boolean;
   startup_command?: string;
+  agent_operation_policy?: AgentOperationPolicy;
   agent_forwarding?: boolean;
   agent_forward_source_id?: number;
 }
@@ -56,6 +60,7 @@ export interface SSHFormState extends ConnectionFormFields {
   restoreCwdOnReconnect: boolean;
   /** SSH 交互式 shell 建立后自动执行的命令，支持换行分隔多条命令。 */
   startupCommand: string;
+  agentOperationPolicy: AgentOperationPolicy;
   /** 是否向远端转发指定 SSH Agent。 */
   agentForwarding: boolean;
   /** 转发使用的 SSH Agent 来源。0 = 未选。 */
@@ -78,6 +83,7 @@ export const SSH_DEFAULTS: SSHFormState = {
   keepAliveIntervalSeconds: 0,
   restoreCwdOnReconnect: false,
   startupCommand: "",
+  agentOperationPolicy: "approval",
   agentForwarding: false,
   agentForwardSourceId: 0,
   ...CONNECTION_DEFAULTS,
@@ -157,6 +163,7 @@ export function buildSSHConfig(state: SSHFormState, opts: SSHBuildOptions): stri
   if (state.startupCommand.trim()) {
     cfg.startup_command = state.startupCommand;
   }
+  if (state.agentOperationPolicy !== "approval") cfg.agent_operation_policy = state.agentOperationPolicy;
 
   return JSON.stringify(cfg);
 }
@@ -184,6 +191,7 @@ export function parseSSHConfig(configJSON: string, assetTunnelId = 0): SSHFormSt
       keepAliveIntervalSeconds: cfg.keepalive_interval_seconds || 0,
       restoreCwdOnReconnect: cfg.restore_cwd_on_reconnect || false,
       startupCommand: cfg.startup_command || "",
+      agentOperationPolicy: cfg.agent_operation_policy ?? "approval",
       agentForwarding: cfg.agent_forwarding || false,
       agentForwardSourceId: cfg.agent_forwarding ? cfg.agent_forward_source_id || 0 : 0,
       ...parseConnectionFields(cfg.proxy, tunnelId, cfg.proxy_chain),

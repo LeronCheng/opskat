@@ -8,6 +8,8 @@ type AuditLog struct {
 	AssetID        int64  `gorm:"column:asset_id;default:0;index"`
 	AssetName      string `gorm:"column:asset_name;type:varchar(255)"`
 	Command        string `gorm:"column:command;type:text"`
+	CommandType    string `gorm:"column:command_type;type:varchar(40)"`
+	Classification string `gorm:"column:classification;type:text"`
 	Request        string `gorm:"column:request;type:text"`
 	Result         string `gorm:"column:result;type:text"`
 	Error          string `gorm:"column:error;type:text"`

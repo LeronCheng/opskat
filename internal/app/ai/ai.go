@@ -53,6 +53,7 @@ type AI struct {
 
 	runners               sync.Map // map[int64]*runnerEntry
 	currentConversationID int64
+	explanationCancels    sync.Map // map[string]context.CancelFunc; independent of conversation runners
 
 	permissionChan     chan runner.PermissionResponse
 	pendingAIApprovals sync.Map // map[string]pendingAIApproval

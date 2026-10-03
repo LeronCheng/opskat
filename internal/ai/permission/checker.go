@@ -248,7 +248,9 @@ func (c *CommandPolicyChecker) Check(ctx context.Context, assetID int64, command
 	if result.Decision != aictx.NeedConfirm {
 		return result
 	}
-	return c.HandleConfirm(ctx, assetID, asset_entity.AssetTypeSSH, command)
+	confirmed := c.HandleConfirm(ctx, assetID, asset_entity.AssetTypeSSH, command)
+	confirmed.Classification = result.Classification
+	return confirmed
 }
 
 // CheckForAsset 按资产类型分发权限检查。
@@ -258,7 +260,9 @@ func (c *CommandPolicyChecker) CheckForAsset(ctx context.Context, assetID int64,
 	if result.Decision != aictx.NeedConfirm {
 		return result
 	}
-	return c.HandleConfirm(ctx, assetID, assetType, command, detail...)
+	confirmed := c.HandleConfirm(ctx, assetID, assetType, command, detail...)
+	confirmed.Classification = result.Classification
+	return confirmed
 }
 
 // HandleConfirm 处理需要用户确认的情况。
