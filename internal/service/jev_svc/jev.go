@@ -3,6 +3,7 @@ package jev_svc
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/cago-frame/cago/pkg/logger"
@@ -12,6 +13,38 @@ import (
 	"github.com/opskat/opskat/internal/service/credential_svc"
 	"go.uber.org/zap"
 )
+
+const (
+	minPrimaryConfidenceThreshold = jev.DefaultPrimaryConfidence
+	maxPrimaryConfidenceThreshold = 1.0
+)
+
+func PrimaryConfidenceThreshold() float64 {
+	threshold := bootstrap.GetConfig().JevPrimaryConfidenceThreshold
+	if threshold == 0 || math.IsNaN(threshold) || math.IsInf(threshold, 0) || threshold < minPrimaryConfidenceThreshold || threshold > maxPrimaryConfidenceThreshold {
+		return jev.DefaultPrimaryConfidence
+	}
+	return threshold
+}
+
+func SavePrimaryConfidenceThreshold(ctx context.Context, threshold float64) error {
+	if math.IsNaN(threshold) || math.IsInf(threshold, 0) || threshold < minPrimaryConfidenceThreshold || threshold > maxPrimaryConfidenceThreshold {
+		return fmt.Errorf("Jev 一级置信度须在 %.0f%%-%.0f%% 之间", minPrimaryConfidenceThreshold*100, maxPrimaryConfidenceThreshold*100)
+	}
+	logger.Ctx(ctx).Info("save Jev confidence threshold started", zap.Float64("threshold", threshold))
+	cfg := bootstrap.GetConfig()
+	if cfg == nil {
+		return fmt.Errorf("config not loaded")
+	}
+	updatedConfig := *cfg
+	updatedConfig.JevPrimaryConfidenceThreshold = threshold
+	if err := bootstrap.SaveConfig(&updatedConfig); err != nil {
+		logger.Ctx(ctx).Error("save Jev confidence threshold failed", zap.Error(err))
+		return err
+	}
+	logger.Ctx(ctx).Info("save Jev confidence threshold completed", zap.Float64("threshold", threshold))
+	return nil
+}
 
 func APIKey(ctx context.Context) (string, error) {
 	logger.Ctx(ctx).Debug("load Jev API key started")
@@ -71,7 +104,9 @@ func Classify(ctx context.Context, asset *asset_entity.Asset, command string) (*
 		return jev.Unclassified("ERROR", "invalid SSH configuration"), err
 	}
 	logger.Ctx(ctx).Info("Jev command classification started", zap.Int64("assetID", asset.ID), zap.String("model", jev.Model))
-	result, err := jev.New(key).Classify(ctx, jev.State{Command: command, Context: map[string]any{
+	client := jev.New(key)
+	client.PrimaryConfidenceThreshold = PrimaryConfidenceThreshold()
+	result, err := client.Classify(ctx, jev.State{Command: command, Context: map[string]any{
 		"asset_type": asset.Type, "host": cfg.Host, "port": cfg.Port, "username": cfg.Username,
 		"execution": "SSH exec request; remote default shell; environment, scripts and file targets are not verified",
 		"output":    "returned through the OpsKat command result channel",

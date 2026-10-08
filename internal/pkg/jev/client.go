@@ -17,10 +17,12 @@ const (
 	Endpoint      = "https://api.typesafe.ai/v1/systemone"
 	Model         = "jev-1.13.0"
 	PolicyVersion = "2026-09-28"
-	// Conservative review thresholds; deployment samples must calibrate them.
-	MinConfidence = 0.8
-	NoulYes       = 0.8
-	NoulNo        = 0.2
+	// DefaultPrimaryConfidence is the default strict lower bound for a primary
+	// classification to be considered a hit. The configured value is applied by
+	// the service when it constructs a client.
+	DefaultPrimaryConfidence = 0.5
+	NoulYes                  = 0.8
+	NoulNo                   = 0.2
 )
 
 //go:embed rules.json
@@ -66,13 +68,19 @@ type State struct {
 }
 
 type Client struct {
-	HTTP     *http.Client
-	Endpoint string
-	APIKey   string
+	HTTP                       *http.Client
+	Endpoint                   string
+	APIKey                     string
+	PrimaryConfidenceThreshold float64
 }
 
 func New(apiKey string) *Client {
-	return &Client{HTTP: &http.Client{Timeout: 15 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, Endpoint: Endpoint, APIKey: apiKey}
+	return &Client{
+		HTTP:                       &http.Client{Timeout: 15 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
+		Endpoint:                   Endpoint,
+		APIKey:                     apiKey,
+		PrimaryConfidenceThreshold: DefaultPrimaryConfidence,
+	}
 }
 
 type response struct {
@@ -170,7 +178,7 @@ func (c *Client) Classify(ctx context.Context, state State) (*Classification, er
 	}
 	result.Level1 = answer.Choice
 	result.Status = "OK"
-	if answer.Choice == "UNKNOWN" || *answer.Confidence < MinConfidence || *chosen < MinConfidence {
+	if answer.Choice == "UNKNOWN" || *answer.Confidence <= c.PrimaryConfidenceThreshold || *chosen <= c.PrimaryConfidenceThreshold {
 		result.Status = "REVIEW"
 		result.Reason = "primary classification requires review"
 	}
@@ -190,6 +198,8 @@ func (c *Client) Classify(ctx context.Context, state State) (*Classification, er
 		result.Status = "ERROR"
 		return result, err
 	}
+	secondaryBestKey := ""
+	secondaryBestProbability := -1.0
 	for key := range questions {
 		var a struct {
 			Noul *float64 `json:"noul"`
@@ -199,13 +209,17 @@ func (c *Client) Classify(ctx context.Context, state State) (*Classification, er
 			result.Level2 = nil
 			return result, fmt.Errorf("invalid Jev secondary answer %s", key)
 		}
-		if *a.Noul >= NoulYes {
-			result.Level2 = append(result.Level2, key)
+		if *a.Noul > NoulNo && (*a.Noul > secondaryBestProbability || (*a.Noul == secondaryBestProbability && (secondaryBestKey == "" || key < secondaryBestKey))) {
+			secondaryBestKey = key
+			secondaryBestProbability = *a.Noul
 		}
 		if *a.Noul > NoulNo && *a.Noul < NoulYes {
 			result.Status = "REVIEW"
 			result.Reason = "secondary classification requires review"
 		}
+	}
+	if secondaryBestKey != "" {
+		result.Level2 = []string{secondaryBestKey}
 	}
 	sort.Strings(result.Level2)
 	return result, nil

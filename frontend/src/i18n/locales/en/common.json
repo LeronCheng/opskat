@@ -3243,7 +3243,9 @@
   "jev": {
     "title": "Jev command classification",
     "description": "Jev classifies server exec commands so the asset’s Agent operation policy can allow automatic execution.",
-    "hint": "The API key is encrypted at rest. When configured, server commands and necessary target context are sent to TypeSafe, without asset passwords or private keys. Failed or uncertain judgments require approval except on trusted assets. Clear and save to remove the key."
+    "hint": "The API key is encrypted at rest. When configured, server commands and necessary target context are sent to TypeSafe, without asset passwords or private keys. Failed or uncertain judgments require approval except on trusted assets. Clear and save to remove the key.",
+    "primaryConfidence": "Primary confidence threshold",
+    "primaryConfidenceHint": "Both the primary confidence and selected type probability must be strictly above this threshold to count as a hit."
   },
   "commandSubtype": {
     "CREDENTIAL_READ": "Credentials and keys",

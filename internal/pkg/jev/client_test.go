@@ -19,6 +19,16 @@ func primaryAnswer(level string) map[string]any {
 	return map[string]any{"choice": level, "confidence": 0.99, "probabilities": probabilities}
 }
 
+func primaryAnswerWithProbability(level string, chosen, confidence float64) map[string]any {
+	probabilities := map[string]float64{}
+	other := (1 - chosen) / float64(len(rules.Primary["level1"].Criteria)-1)
+	for key := range rules.Primary["level1"].Criteria {
+		probabilities[key] = other
+	}
+	probabilities[level] = chosen
+	return map[string]any{"choice": level, "confidence": confidence, "probabilities": probabilities}
+}
+
 func TestClassifyRoutesSecondaryQuestionsWithFullCommand(t *testing.T) {
 	for _, level := range []string{"SAFE_READ", "SAFE_CHANGE", "UNKNOWN", "SENSITIVE_READ", "DANGEROUS_CHANGE"} {
 		t.Run(level, func(t *testing.T) {
@@ -59,7 +69,8 @@ func TestClassifyRoutesSecondaryQuestionsWithFullCommand(t *testing.T) {
 			require.Equal(t, level, result.Level1)
 			if branch, ok := rules.Secondary[level]; ok {
 				require.Equal(t, 2, calls)
-				require.Len(t, result.Level2, len(branch))
+				require.Len(t, result.Level2, 1)
+				require.Contains(t, branch, result.Level2[0])
 			} else {
 				require.Equal(t, 1, calls)
 				require.Empty(t, result.Level2)
@@ -71,6 +82,66 @@ func TestClassifyRoutesSecondaryQuestionsWithFullCommand(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestClassifyUsesStrictlyGreaterPrimaryConfidenceThreshold(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		chosen    float64
+		threshold float64
+		expectOK  bool
+	}{
+		{name: "exact threshold is review", chosen: 0.5, threshold: 0.5, expectOK: false},
+		{name: "above threshold is accepted", chosen: 0.51, threshold: 0.5, expectOK: true},
+		{name: "configured threshold", chosen: 0.76, threshold: 0.75, expectOK: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				answers := map[string]any{"level1": primaryAnswerWithProbability("SAFE_READ", test.chosen, 0.99)}
+				_ = json.NewEncoder(w).Encode(map[string]any{"model": Model, "answers": answers})
+			}))
+			defer server.Close()
+
+			client := New("test-key")
+			client.Endpoint = server.URL
+			client.PrimaryConfidenceThreshold = test.threshold
+			result, err := client.Classify(context.Background(), State{Command: "cat /etc/hosts"})
+			require.NoError(t, err)
+			require.Equal(t, 1, calls)
+			require.Equal(t, test.expectOK, result.Status == "OK")
+		})
+	}
+}
+
+func TestClassifyKeepsOnlyHighestSecondaryProbability(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			State State
+		}
+		require.NoError(t, json.NewDecoder(r.Body).Decode(&request))
+		answers := map[string]any{}
+		if request.State.PriorLevel1 == "" {
+			answers["level1"] = primaryAnswer("DANGEROUS_CHANGE")
+		} else {
+			for key := range rules.Secondary["DANGEROUS_CHANGE"] {
+				p := 0.81
+				if key == "SERVICE_HOST_CHANGE" {
+					p = 0.97
+				}
+				answers[key] = map[string]float64{"noul": p}
+			}
+		}
+		require.NoError(t, json.NewEncoder(w).Encode(map[string]any{"model": Model, "answers": answers}))
+	}))
+	defer server.Close()
+
+	client := New("test-key")
+	client.Endpoint = server.URL
+	result, err := client.Classify(context.Background(), State{Command: "systemctl restart nginx"})
+	require.NoError(t, err)
+	require.Equal(t, []string{"SERVICE_HOST_CHANGE"}, result.Level2)
 }
 
 func TestClassifyDoesNotDowngradeUncertainOrMissingSecondary(t *testing.T) {
@@ -121,6 +192,10 @@ func TestClassifyDoesNotDowngradeUncertainOrMissingSecondary(t *testing.T) {
 				require.NoError(t, err)
 				require.Equal(t, "OK", result.Status)
 				require.Empty(t, result.Level2)
+			case "uncertain":
+				require.NoError(t, err)
+				require.Equal(t, "REVIEW", result.Status)
+				require.Len(t, result.Level2, 1, "uncertain secondary answers still retain the highest candidate")
 			default:
 				require.NoError(t, err)
 				require.Equal(t, "REVIEW", result.Status)

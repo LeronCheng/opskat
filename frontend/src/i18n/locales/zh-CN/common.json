@@ -3243,7 +3243,9 @@
   "jev": {
     "title": "Jev 命令判断",
     "description": "Jev 判断服务器 exec 命令的类型，按资产的 Agent 操作策略决定是否自动运行。",
-    "hint": "API Key 加密保存。已配置时，服务器命令及必要的目标信息会发送给 TypeSafe；不发送资产密码或私钥。判断失败或不确定时转人工审批（信任等级除外）。清空后保存可移除 Key。"
+    "hint": "API Key 加密保存。已配置时，服务器命令及必要的目标信息会发送给 TypeSafe；不发送资产密码或私钥。判断失败或不确定时转人工审批（信任等级除外）。清空后保存可移除 Key。",
+    "primaryConfidence": "一级置信度阈值",
+    "primaryConfidenceHint": "一级置信度和所选类型概率都必须严格高于此阈值才算命中。"
   },
   "commandSubtype": {
     "CREDENTIAL_READ": "凭据与密钥读取",

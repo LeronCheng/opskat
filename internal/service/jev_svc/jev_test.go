@@ -3,6 +3,7 @@ package jev_svc
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -56,4 +57,17 @@ func TestAPIKeyEncryptedPersistenceUpdateAndRemoval(t *testing.T) {
 	bootstrap.GetConfig().JevAPIKey = "corrupt-ciphertext"
 	_, err = APIKey(ctx)
 	require.Error(t, err, "decryption failure must surface")
+}
+
+func TestPrimaryConfidenceThresholdDefaultsAndPersists(t *testing.T) {
+	ctx := context.Background()
+	bootstrap.GetConfig().JevPrimaryConfidenceThreshold = 0
+	require.Equal(t, 0.5, PrimaryConfidenceThreshold())
+	require.NoError(t, SavePrimaryConfidenceThreshold(ctx, 0.73))
+	require.InDelta(t, 0.73, PrimaryConfidenceThreshold(), 0.000001)
+	require.InDelta(t, 0.73, bootstrap.GetConfig().JevPrimaryConfidenceThreshold, 0.000001)
+
+	for _, value := range []float64{math.NaN(), math.Inf(1), 0.49, 1.01} {
+		require.Error(t, SavePrimaryConfidenceThreshold(ctx, value))
+	}
 }
